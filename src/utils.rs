@@ -67,7 +67,7 @@ pub fn compute_level(index: usize, depth: usize, packing_depth: usize) -> usize 
 pub fn opt_packing_factor<T: TreeHash>() -> Option<usize> {
     match T::tree_hash_type() {
         TreeHashType::Basic => Some(T::tree_hash_packing_factor()),
-        TreeHashType::Container | TreeHashType::List | TreeHashType::Vector => None,
+        TreeHashType::Container | TreeHashType::StableContainer | TreeHashType::List | TreeHashType::Vector => None,
     }
 }
 
