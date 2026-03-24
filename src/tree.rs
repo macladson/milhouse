@@ -318,13 +318,11 @@ impl<T: Value> Tree<T> {
                 // If hashes *and* lengths are equal then we can short-cut the recursion
                 // and immediately replace `orig` by the `base` node. If `lengths` are `None`
                 // then we know they are already equal (e.g. we're in a vector).
-                if let (Some(oh), Some(bh)) = (orig_hash, base_hash) {
-                    if oh == bh
-                        && lengths
-                            .is_none_or(|(orig_length, base_length)| orig_length == base_length)
-                    {
-                        return Ok(EqualReplace(base));
-                    }
+                if let (Some(oh), Some(bh)) = (orig_hash, base_hash)
+                    && oh == bh
+                    && lengths.is_none_or(|(orig_length, base_length)| orig_length == base_length)
+                {
+                    return Ok(EqualReplace(base));
                 }
 
                 let new_full_depth = full_depth - 1;
