@@ -1,6 +1,6 @@
 use crate::Arc;
 use educe::Educe;
-use parking_lot::RwLock;
+use std::sync::OnceLock;
 use tree_hash::Hash256;
 
 #[derive(Debug, Educe)]
@@ -8,8 +8,8 @@ use tree_hash::Hash256;
 #[educe(PartialEq, Hash)]
 pub struct Leaf<T> {
     #[educe(PartialEq(ignore), Hash(ignore))]
-    #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_rwlock))]
-    pub hash: RwLock<Hash256>,
+    #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_oncelock))]
+    pub hash: OnceLock<Hash256>,
     #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
     pub value: Arc<T>,
 }
@@ -20,7 +20,10 @@ where
 {
     fn clone(&self) -> Self {
         Self {
-            hash: RwLock::new(*self.hash.read()),
+            hash: match self.hash.get() {
+                Some(&h) => OnceLock::from(h),
+                None => OnceLock::new(),
+            },
             value: self.value.clone(),
         }
     }
@@ -28,12 +31,15 @@ where
 
 impl<T> Leaf<T> {
     pub fn new(value: T) -> Self {
-        Self::with_hash(value, Hash256::ZERO)
+        Self::with_hash(value, None)
     }
 
-    pub fn with_hash(value: T, hash: Hash256) -> Self {
+    pub fn with_hash(value: T, hash: Option<Hash256>) -> Self {
         Self {
-            hash: RwLock::new(hash),
+            hash: match hash {
+                Some(h) => OnceLock::from(h),
+                None => OnceLock::new(),
+            },
             value: Arc::new(value),
         }
     }

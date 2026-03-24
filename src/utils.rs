@@ -106,10 +106,10 @@ pub fn arb_arc<'a, T: Arbitrary<'a>>(
 }
 
 #[cfg(feature = "arbitrary")]
-pub fn arb_rwlock<'a, T: Arbitrary<'a>>(
+pub fn arb_oncelock<'a, T: Arbitrary<'a>>(
     u: &mut arbitrary::Unstructured<'a>,
-) -> arbitrary::Result<parking_lot::RwLock<T>> {
-    T::arbitrary(u).map(parking_lot::RwLock::new)
+) -> arbitrary::Result<std::sync::OnceLock<T>> {
+    T::arbitrary(u).map(std::sync::OnceLock::from)
 }
 
 #[cfg(test)]
