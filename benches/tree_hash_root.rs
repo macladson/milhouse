@@ -48,7 +48,28 @@ pub fn tree_hash_root(c: &mut Criterion) {
     );
 
     c.bench_with_input(
-        BenchmarkId::new("tree_hash_root_list_parallel", size),
+        BenchmarkId::new("tree_hash_root_shared_sequential", size),
+        &size,
+        |b, &size| {
+            b.iter_batched(
+                || {
+                    let l1 = List::<u64, C>::try_from_iter(0..size).unwrap();
+                    let mut l2 = l1.clone();
+                    l2.push(99).unwrap();
+                    l2.apply_updates().unwrap();
+                    (l1, l2)
+                },
+                |(l1, l2)| {
+                    l1.tree_hash_root();
+                    l2.tree_hash_root();
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+
+    c.bench_with_input(
+        BenchmarkId::new("tree_hash_root_shared_parallel", size),
         &size,
         |b, &size| {
             b.iter_batched(
@@ -70,6 +91,74 @@ pub fn tree_hash_root(c: &mut Criterion) {
                     handle_1.join().unwrap();
                     handle_2.join().unwrap();
                 },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+
+    c.bench_with_input(
+        BenchmarkId::new("tree_hash_root_independent_sequential", size),
+        &size,
+        |b, &size| {
+            b.iter_batched(
+                || {
+                    let l1 = List::<u64, C>::try_from_iter(0..size).unwrap();
+                    let l2 = List::<u64, C>::try_from_iter((0..size).rev()).unwrap();
+                    (l1, l2)
+                },
+                |(l1, l2)| {
+                    l1.tree_hash_root();
+                    l2.tree_hash_root();
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+
+    c.bench_with_input(
+        BenchmarkId::new("tree_hash_root_independent_parallel", size),
+        &size,
+        |b, &size| {
+            b.iter_batched(
+                || {
+                    let l1 = List::<u64, C>::try_from_iter(0..size).unwrap();
+                    let l2 = List::<u64, C>::try_from_iter((0..size).rev()).unwrap();
+                    (l1, l2)
+                },
+                |(l1, l2)| {
+                    let handle_1 = std::thread::spawn(move || {
+                        l1.tree_hash_root();
+                    });
+                    let handle_2 = std::thread::spawn(move || {
+                        l2.tree_hash_root();
+                    });
+
+                    handle_1.join().unwrap();
+                    handle_2.join().unwrap();
+                },
+                BatchSize::LargeInput,
+            );
+        },
+    );
+
+    // Build a list with many duplicates, then intra_rebase to create sharing.
+    c.bench_with_input(
+        BenchmarkId::new("tree_hash_root_intra_rebased", size),
+        &size,
+        |b, &size| {
+            b.iter_batched(
+                || {
+                    let mut l =
+                        List::<u64, C>::try_from_iter((0..size as u64).map(|i| i % 256)).unwrap();
+                    l.apply_updates().unwrap();
+                    l.tree_hash_root();
+                    l.intra_rebase().unwrap();
+                    // Mutate one element to invalidate hashes along one path.
+                    *l.get_mut(0).unwrap() = 9999;
+                    l.apply_updates().unwrap();
+                    l
+                },
+                |l| l.tree_hash_root(),
                 BatchSize::LargeInput,
             );
         },
