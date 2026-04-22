@@ -59,3 +59,7 @@ harness = false
 
 [profile.bench]
 debug = true
+
+[patch.crates-io]
+ethereum_ssz = { git = "https://github.com/macladson/ethereum_ssz", branch = "ssz-writer" }
+ethereum_ssz_derive = { git = "https://github.com/macladson/ethereum_ssz", branch = "ssz-writer" }

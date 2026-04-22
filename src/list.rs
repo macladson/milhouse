@@ -473,6 +473,39 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Encode for List<T, N, U> {
             encoder.finalize();
         }
     }
+
+    fn ssz_write(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        if <T as Encode>::is_ssz_fixed_len() {
+            let total_len = <T as Encode>::ssz_fixed_len() * self.len();
+
+            if total_len <= 4096 {
+                // Small list: single allocation + single write is cheaper than chunking.
+                let mut buf = Vec::with_capacity(total_len);
+                self.ssz_append(&mut buf);
+                return w.write_all(&buf);
+            }
+
+            // Large list: stream in chunks to avoid large allocations.
+            let mut chunk = Vec::with_capacity(4096);
+
+            for item in self.iter() {
+                item.ssz_append(&mut chunk);
+                if chunk.len() >= 4096 {
+                    w.write_all(&chunk)?;
+                    chunk.clear();
+                }
+            }
+            if !chunk.is_empty() {
+                w.write_all(&chunk)?;
+            }
+            Ok(())
+        } else {
+            // Variable-length items: fall back to default.
+            let mut buf = Vec::with_capacity(self.ssz_bytes_len());
+            self.ssz_append(&mut buf);
+            w.write_all(&buf)
+        }
+    }
 }
 
 impl<T, N, U> TryFromIter<T> for List<T, N, U>

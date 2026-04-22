@@ -378,6 +378,40 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Encode for Vector<T, N, U> {
             encoder.finalize();
         }
     }
+
+    fn ssz_write(&self, w: &mut dyn std::io::Write) -> std::io::Result<()> {
+        if <T as Encode>::is_ssz_fixed_len() {
+            let total_len = <T as Encode>::ssz_fixed_len() * self.len();
+
+            if total_len <= 4096 {
+                // Small vector: single allocation + single write is cheaper than chunking.
+                let mut buf = Vec::with_capacity(total_len);
+                self.ssz_append(&mut buf);
+                return w.write_all(&buf);
+            }
+
+            // Large vector: stream in chunks to avoid allocating the entire encoded form.
+            // 4096 bytes ≈ 33 Validators or 512 u64s per write call.
+            let mut chunk = Vec::with_capacity(4096);
+
+            for item in self.iter() {
+                item.ssz_append(&mut chunk);
+                if chunk.len() >= 4096 {
+                    w.write_all(&chunk)?;
+                    chunk.clear();
+                }
+            }
+            if !chunk.is_empty() {
+                w.write_all(&chunk)?;
+            }
+            Ok(())
+        } else {
+            // Variable-length items: fall back to default (buffer + write).
+            let mut buf = Vec::with_capacity(self.ssz_bytes_len());
+            self.ssz_append(&mut buf);
+            w.write_all(&buf)
+        }
+    }
 }
 
 impl<T: Value, N: Unsigned, U: UpdateMap<T>> Decode for Vector<T, N, U> {
