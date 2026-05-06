@@ -6,7 +6,10 @@ use crate::level_iter::{LevelIter, LevelNode};
 use crate::serde::ListVisitor;
 use crate::tree::{IntraRebaseAction, RebaseAction};
 use crate::update_map::MaxMap;
-use crate::utils::{Length, compute_level, int_log, opt_packing_depth, updated_length};
+use crate::utils::{
+    DEFAULT_SUBTREE_DEPTH, Length, compute_level, effective_subtree_depth, int_log,
+    opt_packing_depth, updated_length,
+};
 use crate::{Arc, Cow, Error, Tree, UpdateMap, Value};
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
@@ -27,8 +30,13 @@ use vec_map::VecMap;
     arbitrary(bound = "T: Arbitrary<'arbitrary> + Value"),
     arbitrary(bound = "N: Unsigned, U: Arbitrary<'arbitrary> + UpdateMap<T> + PartialEq")
 )]
-pub struct List<T: Value, N: Unsigned, U: UpdateMap<T> = MaxMap<VecMap<T>>> {
-    pub(crate) interface: Interface<T, ListInner<T, N>, U>,
+pub struct List<
+    T: Value,
+    N: Unsigned,
+    U: UpdateMap<T> = MaxMap<VecMap<T>>,
+    const MAX_SUBTREE_DEPTH: usize = DEFAULT_SUBTREE_DEPTH,
+> {
+    pub(crate) interface: Interface<T, ListInner<T, N, MAX_SUBTREE_DEPTH>, U>,
 }
 
 #[derive(Debug, Clone, Educe)]
@@ -38,7 +46,7 @@ pub struct List<T: Value, N: Unsigned, U: UpdateMap<T> = MaxMap<VecMap<T>>> {
     derive(Arbitrary),
     arbitrary(bound = "T: Arbitrary<'arbitrary> + Value, N: Unsigned")
 )]
-pub struct ListInner<T: Value, N: Unsigned> {
+pub struct ListInner<T: Value, N: Unsigned, const MAX_SUBTREE_DEPTH: usize> {
     #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
     pub(crate) tree: Arc<Tree<T>>,
     pub(crate) length: Length,
@@ -48,13 +56,15 @@ pub struct ListInner<T: Value, N: Unsigned> {
     _phantom: PhantomData<N>,
 }
 
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
+impl<T: Value, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize>
+    List<T, N, U, MAX_SUBTREE_DEPTH>
+{
     pub fn new(vec: Vec<T>) -> Result<Self, Error> {
         Self::try_from_iter(vec)
     }
 
     pub(crate) fn from_parts(tree: Arc<Tree<T>>, depth: usize, length: Length) -> Self {
-        let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
+        let packing_depth = Self::packing_depth();
         Self {
             interface: Interface::new(ListInner {
                 tree,
@@ -67,14 +77,21 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
     }
 
     pub fn empty() -> Self {
+        const {
+            assert!(
+                MAX_SUBTREE_DEPTH <= 20,
+                "MAX_SUBTREE_DEPTH must not exceed 20"
+            )
+        };
         // If the leaves are packed then they reduce the depth
         let depth = Self::depth();
-        let tree = Tree::empty(depth);
+        let subtree_depth = Self::effective_subtree_depth();
+        let tree = Tree::packed_zero(depth, subtree_depth);
         Self::from_parts(tree, depth, Length(0))
     }
 
     pub fn repeat(elem: T, n: usize) -> Result<Self, Error> {
-        crate::repeat::repeat_list(elem, n)
+        crate::repeat::repeat_list::<T, N, U, MAX_SUBTREE_DEPTH>(elem, n)
     }
 
     pub fn repeat_slow(elem: T, n: usize) -> Result<Self, Error> {
@@ -82,7 +99,7 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
     }
 
     pub fn builder() -> Result<Builder<T>, Error> {
-        Builder::new(Self::depth(), 0)
+        Builder::new_with_max_subtree_depth(Self::depth(), 0, Self::log_n(), MAX_SUBTREE_DEPTH)
     }
 
     pub fn try_from_iter(iter: impl IntoIterator<Item = T>) -> Result<Self, Error> {
@@ -200,11 +217,24 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
     }
 
     pub(crate) fn depth() -> usize {
-        if let Some(packing_bits) = opt_packing_depth::<T>() {
-            int_log(N::to_usize()).saturating_sub(packing_bits)
+        let log_n = Self::log_n();
+        if let Some(packing_bits) = opt_packing_depth::<T>(log_n, MAX_SUBTREE_DEPTH) {
+            log_n.saturating_sub(packing_bits)
         } else {
-            int_log(N::to_usize())
+            log_n
         }
+    }
+
+    pub(crate) fn effective_subtree_depth() -> usize {
+        effective_subtree_depth::<T>(Self::log_n(), MAX_SUBTREE_DEPTH)
+    }
+
+    pub(crate) fn packing_depth() -> usize {
+        opt_packing_depth::<T>(Self::log_n(), MAX_SUBTREE_DEPTH).unwrap_or(0)
+    }
+
+    fn log_n() -> usize {
+        int_log(N::to_usize())
     }
 
     /// Remove `n` elements from the front of `self`.
@@ -226,9 +256,11 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
         }
 
         let depth = Self::depth();
-        let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
+        let log_n = Self::log_n();
+        let packing_depth = Self::packing_depth();
         let level = compute_level(n, depth, packing_depth);
-        let mut builder = Builder::new(Self::depth(), level)?;
+        let mut builder =
+            Builder::new_with_max_subtree_depth(Self::depth(), level, log_n, MAX_SUBTREE_DEPTH)?;
         let mut level_iter = self.level_iter_from(n)?.peekable();
 
         while let Some(item) = level_iter.next() {
@@ -256,7 +288,15 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
     }
 }
 
-impl<T: Value, N: Unsigned> ImmList<T> for ListInner<T, N> {
+impl<T: Value, N: Unsigned, const MAX_SUBTREE_DEPTH: usize> ListInner<T, N, MAX_SUBTREE_DEPTH> {
+    fn effective_subtree_depth() -> usize {
+        effective_subtree_depth::<T>(int_log(N::to_usize()), MAX_SUBTREE_DEPTH)
+    }
+}
+
+impl<T: Value, N: Unsigned, const MAX_SUBTREE_DEPTH: usize> ImmList<T>
+    for ListInner<T, N, MAX_SUBTREE_DEPTH>
+{
     fn get(&self, index: usize) -> Option<&T> {
         if index < self.len().as_usize() {
             self.tree
@@ -271,15 +311,27 @@ impl<T: Value, N: Unsigned> ImmList<T> for ListInner<T, N> {
     }
 
     fn iter_from(&self, index: usize) -> Iter<'_, T> {
-        Iter::from_index(index, &self.tree, self.depth, self.length)
+        Iter::from_index(
+            index,
+            &self.tree,
+            self.depth,
+            self.length,
+            self.packing_depth,
+        )
     }
 
     fn level_iter_from(&self, index: usize) -> LevelIter<'_, T> {
-        LevelIter::from_index(index, &self.tree, self.depth, self.length)
+        LevelIter::from_index(
+            index,
+            &self.tree,
+            self.depth,
+            self.length,
+            self.packing_depth,
+        )
     }
 }
 
-impl<T, N> MutList<T> for ListInner<T, N>
+impl<T, N, const MAX_SUBTREE_DEPTH: usize> MutList<T> for ListInner<T, N, MAX_SUBTREE_DEPTH>
 where
     T: Value,
     N: Unsigned,
@@ -300,7 +352,13 @@ where
             });
         }
 
-        self.tree = self.tree.with_updated_leaf(index, value, self.depth)?;
+        self.tree = self.tree.with_updated_leaf(
+            index,
+            value,
+            self.depth,
+            self.packing_depth,
+            Self::effective_subtree_depth(),
+        )?;
         if index == self.length.as_usize() {
             *self.length.as_mut() += 1;
         }
@@ -321,14 +379,21 @@ where
             return Ok(());
         }
         self.length = updated_length(self.length, &updates);
-        self.tree =
-            self.tree
-                .with_updated_leaves(&updates, 0, self.depth, hash_updates.as_ref())?;
+        self.tree = self.tree.with_updated_leaves(
+            &updates,
+            0,
+            self.depth,
+            hash_updates.as_ref(),
+            self.packing_depth,
+            Self::effective_subtree_depth(),
+        )?;
         Ok(())
     }
 }
 
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
+impl<T: Value, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize>
+    List<T, N, U, MAX_SUBTREE_DEPTH>
+{
     pub fn rebase(&self, base: &Self) -> Result<Self, Error> {
         let mut rebased = self.clone();
         rebased.rebase_on(base)?;
@@ -354,7 +419,9 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
     }
 }
 
-impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
+impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize>
+    List<T, N, U, MAX_SUBTREE_DEPTH>
+{
     pub fn intra_rebase(&mut self) -> Result<(), Error> {
         // We need to be fully hashed in order to intra-rebase. To avoid putting this burden on the
         // caller, just do it here. If we're already fully-hashed this should be quick.
@@ -373,13 +440,17 @@ impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
     }
 }
 
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> Default for List<T, N, U> {
+impl<T: Value, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize> Default
+    for List<T, N, U, MAX_SUBTREE_DEPTH>
+{
     fn default() -> Self {
         Self::empty()
     }
 }
 
-impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> TreeHash for List<T, N, U> {
+impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize> TreeHash
+    for List<T, N, U, MAX_SUBTREE_DEPTH>
+{
     fn tree_hash_type() -> tree_hash::TreeHashType {
         tree_hash::TreeHashType::List
     }
@@ -396,12 +467,18 @@ impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> TreeHash for List<T, 
         // FIXME(sproul): remove assert
         assert!(!self.interface.has_pending_updates());
 
-        let root = self.interface.backing.tree.tree_hash();
+        let root = self
+            .interface
+            .backing
+            .tree
+            .tree_hash(Self::effective_subtree_depth());
         tree_hash::mix_in_length(&root, self.len())
     }
 }
 
-impl<'a, T: Value, N: Unsigned, U: UpdateMap<T>> IntoIterator for &'a List<T, N, U> {
+impl<'a, T: Value, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize> IntoIterator
+    for &'a List<T, N, U, MAX_SUBTREE_DEPTH>
+{
     type Item = &'a T;
     type IntoIter = InterfaceIter<'a, T, U>;
 
@@ -410,7 +487,8 @@ impl<'a, T: Value, N: Unsigned, U: UpdateMap<T>> IntoIterator for &'a List<T, N,
     }
 }
 
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> Serialize for List<T, N, U>
+impl<T: Value, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize> Serialize
+    for List<T, N, U, MAX_SUBTREE_DEPTH>
 where
     T: Serialize,
 {
@@ -426,7 +504,8 @@ where
     }
 }
 
-impl<'de, T, N, U> Deserialize<'de> for List<T, N, U>
+impl<'de, T, N, U, const MAX_SUBTREE_DEPTH: usize> Deserialize<'de>
+    for List<T, N, U, MAX_SUBTREE_DEPTH>
 where
     T: Deserialize<'de> + Value,
     N: Unsigned,
@@ -436,12 +515,14 @@ where
     where
         D: Deserializer<'de>,
     {
-        deserializer.deserialize_seq(ListVisitor::default())
+        deserializer.deserialize_seq(ListVisitor::<T, N, U, MAX_SUBTREE_DEPTH>::default())
     }
 }
 
 // FIXME: duplicated from `ssz::encode::impl_for_vec`
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> Encode for List<T, N, U> {
+impl<T: Value, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize> Encode
+    for List<T, N, U, MAX_SUBTREE_DEPTH>
+{
     fn is_ssz_fixed_len() -> bool {
         false
     }
@@ -475,7 +556,7 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Encode for List<T, N, U> {
     }
 }
 
-impl<T, N, U> TryFromIter<T> for List<T, N, U>
+impl<T, N, U, const MAX_SUBTREE_DEPTH: usize> TryFromIter<T> for List<T, N, U, MAX_SUBTREE_DEPTH>
 where
     T: Value,
     N: Unsigned,
@@ -491,7 +572,7 @@ where
     }
 }
 
-impl<T, N, U> Decode for List<T, N, U>
+impl<T, N, U, const MAX_SUBTREE_DEPTH: usize> Decode for List<T, N, U, MAX_SUBTREE_DEPTH>
 where
     T: Value,
     N: Unsigned,

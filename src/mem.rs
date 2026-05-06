@@ -125,7 +125,9 @@ impl<T: Value + MemorySize> MemorySize for Tree<T> {
     }
 }
 
-impl<T: Value + MemorySize, N: Unsigned, U: UpdateMap<T>> MemorySize for List<T, N, U> {
+impl<T: Value + MemorySize, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize> MemorySize
+    for List<T, N, U, MAX_SUBTREE_DEPTH>
+{
     fn self_pointer(&self) -> usize {
         self as *const _ as usize
     }
@@ -142,7 +144,9 @@ impl<T: Value + MemorySize, N: Unsigned, U: UpdateMap<T>> MemorySize for List<T,
     }
 }
 
-impl<T: Value + MemorySize, N: Unsigned, U: UpdateMap<T>> MemorySize for Vector<T, N, U> {
+impl<T: Value + MemorySize, N: Unsigned, U: UpdateMap<T>, const MAX_SUBTREE_DEPTH: usize> MemorySize
+    for Vector<T, N, U, MAX_SUBTREE_DEPTH>
+{
     fn self_pointer(&self) -> usize {
         self as *const _ as usize
     }

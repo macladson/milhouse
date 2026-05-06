@@ -1,11 +1,14 @@
-use crate::utils::{Length, opt_packing_factor};
+use crate::utils::{Length, effective_subtree_depth, int_log, opt_packing_factor};
 use crate::{Arc, Error, Leaf, List, PackedLeaf, Tree, UpdateMap, Value};
 use smallvec::{SmallVec, smallvec};
 use tree_hash::Hash256;
 use typenum::Unsigned;
 
 /// Efficiently construct a list from `n` copies of `elem`.
-pub fn repeat_list<T, N, U>(elem: T, n: usize) -> Result<List<T, N, U>, Error>
+pub fn repeat_list<T, N, U, const MAX_SUBTREE_DEPTH: usize>(
+    elem: T,
+    n: usize,
+) -> Result<List<T, N, U, MAX_SUBTREE_DEPTH>, Error>
 where
     T: Value,
     N: Unsigned,
@@ -18,8 +21,10 @@ where
     // Keep a list of nodes at the current level and their multiplicity.
     // In the common case where `n` is not divisible by the packing factor then part of the
     // tree will be slightly different from the bulk repeated part.
-    let packing_factor = opt_packing_factor::<T>();
-    let tree_depth = List::<T, N, U>::depth();
+    let log_n = int_log(N::to_usize());
+    let packing_factor = opt_packing_factor::<T>(log_n, MAX_SUBTREE_DEPTH);
+    let subtree_depth = effective_subtree_depth::<T>(log_n, MAX_SUBTREE_DEPTH);
+    let tree_depth = List::<T, N, U, MAX_SUBTREE_DEPTH>::depth();
 
     let mut layer: SmallVec<[_; 2]> = if let Some(packing_factor) = packing_factor {
         let repeat_count = n / packing_factor;
@@ -27,8 +32,13 @@ where
         let repeat_leaf = Arc::new(Tree::PackedLeaf(PackedLeaf::repeat(
             elem.clone(),
             packing_factor,
+            subtree_depth,
         )));
-        let lonely_leaf = Arc::new(Tree::PackedLeaf(PackedLeaf::repeat(elem, lonely_count)));
+        let lonely_leaf = Arc::new(Tree::PackedLeaf(PackedLeaf::repeat(
+            elem,
+            lonely_count,
+            subtree_depth,
+        )));
         match (repeat_count, lonely_count) {
             (0, 0) => unreachable!("n != 0"),
             (_, 0) => smallvec![(repeat_leaf, repeat_count)],
@@ -45,7 +55,11 @@ where
         let new_layer = match &layer[..] {
             [(repeat_leaf, 1)] => {
                 smallvec![(
-                    Tree::node(repeat_leaf.clone(), Tree::zero(depth), Hash256::ZERO),
+                    Tree::node(
+                        repeat_leaf.clone(),
+                        Tree::packed_zero(depth, subtree_depth),
+                        Hash256::ZERO
+                    ),
                     1,
                 )]
             }
@@ -62,7 +76,11 @@ where
                         repeat_count / 2,
                     ),
                     (
-                        Tree::node(repeat_leaf.clone(), Tree::zero(depth), Hash256::ZERO),
+                        Tree::node(
+                            repeat_leaf.clone(),
+                            Tree::packed_zero(depth, subtree_depth),
+                            Hash256::ZERO
+                        ),
                         1,
                     ),
                 ]
@@ -81,7 +99,11 @@ where
                             repeat_count / 2,
                         ),
                         (
-                            Tree::node(lonely_leaf.clone(), Tree::zero(depth), Hash256::ZERO),
+                            Tree::node(
+                                lonely_leaf.clone(),
+                                Tree::packed_zero(depth, subtree_depth),
+                                Hash256::ZERO
+                            ),
                             1,
                         ),
                     ]

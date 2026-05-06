@@ -1,9 +1,13 @@
+use crate::update_map::MaxMap;
 use crate::{Vector, mem::MemoryTracker};
 use typenum::U1024;
+use vec_map::VecMap;
+
+type ShallowVector = Vector<u64, U1024, MaxMap<VecMap<u64>>, 0>;
 
 #[test]
 fn vector_mutate_last() {
-    let v1 = Vector::<u64, U1024>::new(vec![1; 1024]).unwrap();
+    let v1 = ShallowVector::new(vec![1; 1024]).unwrap();
     let mut v2 = v1.clone();
     *v2.get_mut(1023).unwrap() = 2;
     v2.apply_updates().unwrap();

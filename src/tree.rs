@@ -1,4 +1,4 @@
-use crate::utils::{Length, opt_hash, opt_packing_depth, opt_packing_factor};
+use crate::utils::{Length, opt_hash};
 use crate::{Arc, Error, Leaf, PackedLeaf, UpdateMap, Value};
 use educe::Educe;
 use ethereum_hashing::{ZERO_HASHES, hash32_concat};
@@ -23,6 +23,10 @@ pub enum Tree<T: Value> {
         #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
         right: Arc<Self>,
     },
+    /// A subtree of all zeros. The `usize` is the depth of the zero subtree, corresponding to
+    /// `ZERO_HASHES[depth]`.
+    ///
+    /// Use [`Tree::packed_zero`] to construct a zero node at a packed-leaf position.
     Zero(usize),
 }
 
@@ -58,6 +62,14 @@ impl<T: Value> Tree<T> {
         Arc::new(Self::Zero(depth))
     }
 
+    /// Create a zero node at a position where a `PackedLeaf` would appear.
+    ///
+    /// The resulting `Zero` node has depth `logical_depth + subtree_depth` because
+    /// packed leaves absorb `subtree_depth` levels of the Merkle tree internally.
+    pub fn packed_zero(logical_depth: usize, subtree_depth: usize) -> Arc<Self> {
+        Arc::new(Self::Zero(logical_depth + subtree_depth))
+    }
+
     pub fn leaf(value: T) -> Arc<Self> {
         Arc::new(Self::Leaf(Leaf::new(value)))
     }
@@ -86,7 +98,7 @@ impl<T: Value> Tree<T> {
         match self {
             Self::Leaf(Leaf { value, .. }) if depth == 0 => Some(value),
             Self::PackedLeaf(PackedLeaf { values, .. }) if depth == 0 => {
-                values.get(index % T::tree_hash_packing_factor())
+                values.get(index % (1 << packing_depth))
             }
             Self::Node { left, right, .. } if depth > 0 => {
                 let new_depth = depth - 1;
@@ -111,19 +123,26 @@ impl<T: Value> Tree<T> {
         index: usize,
         new_value: T,
         depth: usize,
+        packing_depth: usize,
+        subtree_depth: usize,
     ) -> Result<Arc<Self>, Error> {
         match self {
             Self::Leaf(_) if depth == 0 => Ok(Self::leaf(new_value)),
             Self::PackedLeaf(leaf) if depth == 0 => Ok(Arc::new(Self::PackedLeaf(
-                leaf.insert_at_index(index, new_value)?,
+                leaf.insert_at_index(index, new_value, subtree_depth)?,
             ))),
             Self::Node { left, right, .. } if depth > 0 => {
-                let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
                 let new_depth = depth - 1;
                 if (index >> (new_depth + packing_depth)) & 1 == 0 {
                     // Index lies on the left, recurse left
                     Ok(Self::node(
-                        left.with_updated_leaf(index, new_value, new_depth)?,
+                        left.with_updated_leaf(
+                            index,
+                            new_value,
+                            new_depth,
+                            packing_depth,
+                            subtree_depth,
+                        )?,
                         right.clone(),
                         Hash256::ZERO,
                     ))
@@ -131,24 +150,38 @@ impl<T: Value> Tree<T> {
                     // Index lies on the right, recurse right
                     Ok(Self::node(
                         left.clone(),
-                        right.with_updated_leaf(index, new_value, new_depth)?,
+                        right.with_updated_leaf(
+                            index,
+                            new_value,
+                            new_depth,
+                            packing_depth,
+                            subtree_depth,
+                        )?,
                         Hash256::ZERO,
                     ))
                 }
             }
-            Self::Zero(zero_depth) if *zero_depth == depth => {
+            Self::Zero(zero_depth) if *zero_depth == depth + subtree_depth => {
                 if depth == 0 {
-                    if opt_packing_factor::<T>().is_some() {
-                        Ok(Arc::new(Self::PackedLeaf(PackedLeaf::single(new_value))))
+                    if packing_depth > 0 {
+                        Ok(Arc::new(Self::PackedLeaf(PackedLeaf::single(
+                            new_value,
+                            subtree_depth,
+                        ))))
                     } else {
                         Ok(Self::leaf(new_value))
                     }
                 } else {
                     // Split zero node into a node with left and right, and recurse into
                     // the appropriate subtree
-                    let new_zero = Self::zero(depth - 1);
-                    Self::node(new_zero.clone(), new_zero, Hash256::ZERO)
-                        .with_updated_leaf(index, new_value, depth)
+                    let new_zero = Self::zero(*zero_depth - 1);
+                    Self::node(new_zero.clone(), new_zero, Hash256::ZERO).with_updated_leaf(
+                        index,
+                        new_value,
+                        depth,
+                        packing_depth,
+                        subtree_depth,
+                    )
                 }
             }
             _ => Err(Error::UpdateLeafError),
@@ -161,6 +194,8 @@ impl<T: Value> Tree<T> {
         prefix: usize,
         depth: usize,
         hashes: Option<&BTreeMap<(usize, usize), Hash256>>,
+        packing_depth: usize,
+        subtree_depth: usize,
     ) -> Result<Arc<Self>, Error> {
         let hash = opt_hash(hashes, depth, prefix).unwrap_or_default();
 
@@ -174,10 +209,9 @@ impl<T: Value> Tree<T> {
                 Ok(Self::leaf_with_hash(value, hash))
             }
             Self::PackedLeaf(packed_leaf) if depth == 0 => Ok(Arc::new(Self::PackedLeaf(
-                packed_leaf.update(prefix, hash, updates)?,
+                packed_leaf.update(prefix, hash, updates, subtree_depth)?,
             ))),
             Self::Node { left, right, .. } if depth > 0 => {
-                let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
                 let new_depth = depth - 1;
                 let left_prefix = prefix;
                 let right_prefix = prefix | (1 << (new_depth + packing_depth));
@@ -200,22 +234,41 @@ impl<T: Value> Tree<T> {
                 }
 
                 let new_left = if has_left_updates {
-                    left.with_updated_leaves(updates, left_prefix, new_depth, hashes)?
+                    left.with_updated_leaves(
+                        updates,
+                        left_prefix,
+                        new_depth,
+                        hashes,
+                        packing_depth,
+                        subtree_depth,
+                    )?
                 } else {
                     left.clone()
                 };
                 let new_right = if has_right_updates {
-                    right.with_updated_leaves(updates, right_prefix, new_depth, hashes)?
+                    right.with_updated_leaves(
+                        updates,
+                        right_prefix,
+                        new_depth,
+                        hashes,
+                        packing_depth,
+                        subtree_depth,
+                    )?
                 } else {
                     right.clone()
                 };
 
                 Ok(Self::node(new_left, new_right, hash))
             }
-            Self::Zero(zero_depth) if *zero_depth == depth => {
+            Self::Zero(zero_depth) if *zero_depth == depth + subtree_depth => {
                 if depth == 0 {
-                    if opt_packing_factor::<T>().is_some() {
-                        let packed_leaf = PackedLeaf::empty().update(prefix, hash, updates)?;
+                    if packing_depth > 0 {
+                        let packed_leaf = PackedLeaf::empty(subtree_depth).update(
+                            prefix,
+                            hash,
+                            updates,
+                            subtree_depth,
+                        )?;
                         Ok(Arc::new(Self::PackedLeaf(packed_leaf)))
                     } else {
                         let index = prefix;
@@ -227,9 +280,15 @@ impl<T: Value> Tree<T> {
                     }
                 } else {
                     // Split zero node into a node with left and right and recurse.
-                    let new_zero = Self::zero(depth - 1);
-                    Self::node(new_zero.clone(), new_zero, hash)
-                        .with_updated_leaves(updates, prefix, depth, hashes)
+                    let new_zero = Self::zero(*zero_depth - 1);
+                    Self::node(new_zero.clone(), new_zero, hash).with_updated_leaves(
+                        updates,
+                        prefix,
+                        depth,
+                        hashes,
+                        packing_depth,
+                        subtree_depth,
+                    )
                 }
             }
             _ => Err(Error::UpdateLeavesError),
@@ -285,7 +344,7 @@ impl<T: Value> Tree<T> {
                 }
             }
             (Self::PackedLeaf(l1), Self::PackedLeaf(l2)) => {
-                if l1.values == l2.values {
+                if l1 == l2 {
                     Ok(RebaseAction::EqualReplace(base))
                 } else {
                     Ok(RebaseAction::NotEqualNoop)
@@ -492,7 +551,7 @@ impl<T: Value> Tree<T> {
 }
 
 impl<T: Value + Send + Sync> Tree<T> {
-    pub fn tree_hash(&self) -> Hash256 {
+    pub(crate) fn tree_hash(&self, subtree_depth: usize) -> Hash256 {
         match self {
             Self::Leaf(Leaf { hash, value }) => {
                 // FIXME(sproul): upgradeable RwLock?
@@ -515,7 +574,7 @@ impl<T: Value + Send + Sync> Tree<T> {
                     tree_hash
                 }
             }
-            Self::PackedLeaf(leaf) => leaf.tree_hash(),
+            Self::PackedLeaf(leaf) => leaf.tree_hash(subtree_depth),
             Self::Zero(depth) => Hash256::from(ZERO_HASHES[*depth]),
             Self::Node { hash, left, right } => {
                 let read_lock = hash.read();
@@ -526,8 +585,10 @@ impl<T: Value + Send + Sync> Tree<T> {
                     existing_hash
                 } else {
                     // Parallelism goes brrrr.
-                    let (left_hash, right_hash) =
-                        rayon::join(|| left.tree_hash(), || right.tree_hash());
+                    let (left_hash, right_hash) = rayon::join(
+                        || left.tree_hash(subtree_depth),
+                        || right.tree_hash(subtree_depth),
+                    );
                     let tree_hash =
                         Hash256::from(hash32_concat(left_hash.as_slice(), right_hash.as_slice()));
                     *hash.write() = tree_hash;

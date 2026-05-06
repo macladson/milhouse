@@ -3,6 +3,30 @@ use crate::{Arc, UpdateMap};
 use arbitrary::Arbitrary;
 use std::collections::BTreeMap;
 use tree_hash::{Hash256, TreeHash, TreeHashType};
+
+/// Default depth of the internal Merkle subtree computed within each packed leaf.
+///
+/// This controls the default maximum "fatness" of packed leaves so that each leaf holds up to
+/// `T::tree_hash_packing_factor() << DEFAULT_SUBTREE_DEPTH` values and computes a
+/// multi-level internal Merkle tree.
+///
+/// The effective subtree depth for a given list is `min(MAX_SUBTREE_DEPTH, chunk_tree_depth)`
+/// where `chunk_tree_depth = int_log(N) - int_log(T::tree_hash_packing_factor())`.
+/// This ensures the fat leaf never exceeds the total tree depth required by the SSZ spec.
+///
+/// | Value | Chunks/leaf |
+/// |-------|-------------|
+/// | 0     | 1           |
+/// | 1     | 2           |
+/// | 2     | 4           |
+/// | 3     | 8           |
+/// | 10    | 1024        |
+///
+/// Higher values increase throughput for full-tree recomputation at the cost
+/// of coarser hash invalidation granularity (more values share a single
+/// cached hash).
+pub const DEFAULT_SUBTREE_DEPTH: usize = 2;
+
 /// Type to abstract over whether `T` is wrapped in an `Arc` or not.
 #[derive(Debug)]
 pub enum MaybeArced<T> {
@@ -64,17 +88,56 @@ pub fn compute_level(index: usize, depth: usize, packing_depth: usize) -> usize 
     }
 }
 
-pub fn opt_packing_factor<T: TreeHash>() -> Option<usize> {
+/// Compute the effective subtree depth for a list/vector of capacity `N`.
+///
+/// This is `min(max_subtree_depth, available_chunk_depth)` where `available_chunk_depth`
+/// is the number of tree levels that exist above the base-packed chunks for a tree
+/// of capacity N.
+///
+/// `log_n` should be `int_log(N)` where N is the list/vector capacity.
+#[inline]
+pub fn effective_subtree_depth<T: TreeHash>(log_n: usize, max_subtree_depth: usize) -> usize {
     match T::tree_hash_type() {
-        TreeHashType::Basic => Some(T::tree_hash_packing_factor()),
+        TreeHashType::Basic => {
+            let base_packing_depth = int_log(T::tree_hash_packing_factor());
+            let available = log_n.saturating_sub(base_packing_depth);
+            max_subtree_depth.min(available)
+        }
+        _ => 0,
+    }
+}
+
+/// Compute the effective packing factor for a list/vector of capacity N.
+///
+/// This is `T::tree_hash_packing_factor() << effective_subtree_depth(log_n)`, i.e.
+/// the number of `T` values that fit in one fat packed leaf.
+///
+/// Returns `None` for non-basic (container/list/vector) types.
+pub fn opt_packing_factor<T: TreeHash>(log_n: usize, max_subtree_depth: usize) -> Option<usize> {
+    match T::tree_hash_type() {
+        TreeHashType::Basic => {
+            let eff = effective_subtree_depth::<T>(log_n, max_subtree_depth);
+            Some(T::tree_hash_packing_factor() << eff)
+        }
         TreeHashType::Container | TreeHashType::List | TreeHashType::Vector => None,
     }
 }
 
-/// Compute the depth in a tree at which to start packing values into a `PackedLeaf`.
-pub fn opt_packing_depth<T: TreeHash>() -> Option<usize> {
-    let packing_factor = opt_packing_factor::<T>()?;
-    Some(int_log(packing_factor))
+/// Compute the effective packing depth for a list/vector of capacity N.
+///
+/// This accounts for both the natural packing depth of the type (how many values
+/// fit in one 32-byte chunk) and the effective subtree depth for this capacity.
+///
+/// Returns `None` for non-basic types.
+pub fn opt_packing_depth<T: TreeHash>(log_n: usize, max_subtree_depth: usize) -> Option<usize> {
+    match T::tree_hash_type() {
+        TreeHashType::Basic => {
+            let base = int_log(T::tree_hash_packing_factor());
+            let eff = effective_subtree_depth::<T>(log_n, max_subtree_depth);
+            Some(base + eff)
+        }
+        TreeHashType::Container | TreeHashType::List | TreeHashType::Vector => None,
+    }
 }
 
 /// Compute the maximum index of a BTreeMap.
@@ -139,5 +202,43 @@ mod test {
         assert_eq!(compute_level(2, depth, packing_depth), 0);
         assert_eq!(compute_level(4, depth, packing_depth), 0);
         assert_eq!(compute_level(8, depth, packing_depth), 3);
+    }
+
+    #[test]
+    fn effective_subtree_depth_u64() {
+        // u64: base packing factor = 4, base packing depth = 2
+        assert_eq!(
+            effective_subtree_depth::<u64>(int_log(16), DEFAULT_SUBTREE_DEPTH),
+            DEFAULT_SUBTREE_DEPTH.min(2)
+        );
+        assert_eq!(
+            effective_subtree_depth::<u64>(int_log(32), DEFAULT_SUBTREE_DEPTH),
+            DEFAULT_SUBTREE_DEPTH.min(3)
+        );
+        assert_eq!(
+            effective_subtree_depth::<u64>(int_log(1024), DEFAULT_SUBTREE_DEPTH),
+            DEFAULT_SUBTREE_DEPTH.min(8)
+        );
+        assert_eq!(
+            effective_subtree_depth::<u64>(int_log(1048576), DEFAULT_SUBTREE_DEPTH),
+            DEFAULT_SUBTREE_DEPTH.min(18)
+        );
+    }
+
+    #[test]
+    fn effective_subtree_depth_u8() {
+        // u8: base packing factor = 32, base packing depth = 5
+        assert_eq!(
+            effective_subtree_depth::<u8>(int_log(32), DEFAULT_SUBTREE_DEPTH),
+            DEFAULT_SUBTREE_DEPTH.min(0)
+        );
+        assert_eq!(
+            effective_subtree_depth::<u8>(int_log(256), DEFAULT_SUBTREE_DEPTH),
+            DEFAULT_SUBTREE_DEPTH.min(3)
+        );
+        assert_eq!(
+            effective_subtree_depth::<u8>(int_log(1024), DEFAULT_SUBTREE_DEPTH),
+            DEFAULT_SUBTREE_DEPTH.min(5)
+        );
     }
 }

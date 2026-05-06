@@ -1,6 +1,6 @@
 use crate::{
     Arc, PackedLeaf, Tree, Value,
-    utils::{Length, compute_level, opt_packing_depth, opt_packing_factor},
+    utils::{Length, compute_level},
 };
 
 /// Iterator over the internal nodes at a given `depth` (level) in a tree.
@@ -16,11 +16,9 @@ pub struct LevelIter<'a, T: Value> {
     level: usize,
     /// The `depth` of the root tree.
     full_depth: usize,
-    /// Cached packing factor to avoid re-calculating `opt_packing_factor`.
-    ///
-    /// Initialised to 0 if `T` is not packed.
+    /// Cached packing factor: `1 << packing_depth`.
     packing_factor: usize,
-    /// Cached packing depth to avoid re-calculating `opt_packing_depth`.
+    /// Cached packing depth.
     packing_depth: usize,
     /// Number of elements in the list being iterated.
     length: Length,
@@ -38,12 +36,15 @@ pub enum LevelNode<'a, T: Value> {
 }
 
 impl<'a, T: Value> LevelIter<'a, T> {
-    pub fn from_index(index: usize, root: &'a Arc<Tree<T>>, depth: usize, length: Length) -> Self {
+    pub fn from_index(
+        index: usize,
+        root: &'a Arc<Tree<T>>,
+        depth: usize,
+        length: Length,
+        packing_depth: usize,
+    ) -> Self {
         let mut stack = Vec::with_capacity(depth);
         stack.push(root);
-
-        let packing_factor = opt_packing_factor::<T>().unwrap_or(0);
-        let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
 
         let level = compute_level(index, depth, packing_depth);
 
@@ -52,7 +53,7 @@ impl<'a, T: Value> LevelIter<'a, T> {
             index,
             level,
             full_depth: depth,
-            packing_factor,
+            packing_factor: 1 << packing_depth,
             packing_depth,
             length,
         }

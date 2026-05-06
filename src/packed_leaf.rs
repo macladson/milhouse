@@ -1,5 +1,6 @@
 use crate::{Error, UpdateMap};
 use educe::Educe;
+use ethereum_hashing::hash32_concat;
 use parking_lot::RwLock;
 use std::ops::ControlFlow;
 use tree_hash::{BYTES_PER_CHUNK, Hash256, TreeHash};
@@ -27,36 +28,93 @@ where
 }
 
 impl<T: TreeHash + Clone> PackedLeaf<T> {
-    pub fn tree_hash(&self) -> Hash256 {
+    #[inline(always)]
+    fn capacity_for_subtree_depth(subtree_depth: usize) -> usize {
+        T::tree_hash_packing_factor() << subtree_depth
+    }
+
+    /// Hash adjacent pairs of Hash256 values in-place, reducing count by half.
+    /// Returns the new count (count / 2).
+    fn hash_layer_inplace(buf: &mut [Hash256], count: usize) -> usize {
+        debug_assert!(count.is_power_of_two(), "count must be a power of two");
+        let pairs = count / 2;
+        for i in 0..pairs {
+            let hash = hash32_concat(buf[2 * i].as_slice(), buf[2 * i + 1].as_slice());
+            buf[i] = Hash256::from(hash);
+        }
+        pairs
+    }
+
+    pub fn tree_hash(&self, subtree_depth: usize) -> Hash256 {
         let read_lock = self.hash.read();
-        let mut hash = *read_lock;
+        let existing = *read_lock;
         drop(read_lock);
 
-        if !hash.is_zero() {
-            return hash;
+        if !existing.is_zero() {
+            return existing;
         }
 
-        let hash_bytes = hash.as_mut_slice();
+        let hash = if subtree_depth == 0 {
+            // Original behavior: pack all values into a single Hash256 chunk, no hashing.
+            let mut chunk = Hash256::ZERO;
+            let chunk_bytes = chunk.as_mut_slice();
 
-        let value_len = BYTES_PER_CHUNK / T::tree_hash_packing_factor();
-        for (i, value) in self.values.iter().enumerate() {
-            hash_bytes[i * value_len..(i + 1) * value_len]
-                .copy_from_slice(&value.tree_hash_packed_encoding());
-        }
+            let value_len = BYTES_PER_CHUNK / T::tree_hash_packing_factor();
+            for (i, value) in self.values.iter().enumerate() {
+                chunk_bytes[i * value_len..(i + 1) * value_len]
+                    .copy_from_slice(&value.tree_hash_packed_encoding());
+            }
+            chunk
+        } else {
+            // Fat packed leaf: pack values into multiple chunks then reduce via merkle hashing.
+            let num_chunks = 1usize << subtree_depth;
+            let chunk_packing_factor = T::tree_hash_packing_factor();
+            let value_len = BYTES_PER_CHUNK / chunk_packing_factor;
+
+            // Use a stack buffer for small depths, heap for larger ones.
+            let mut heap_chunks;
+            let mut stack_chunks = [Hash256::ZERO; 16];
+            let chunks: &mut [Hash256] = if num_chunks <= 16 {
+                &mut stack_chunks[..num_chunks]
+            } else {
+                heap_chunks = vec![Hash256::ZERO; num_chunks];
+                &mut heap_chunks[..]
+            };
+
+            // Pack values into chunks.
+            for (i, value) in self.values.iter().enumerate() {
+                let chunk_idx = i / chunk_packing_factor;
+                let pos_in_chunk = i % chunk_packing_factor;
+                let encoding = value.tree_hash_packed_encoding();
+                chunks[chunk_idx].as_mut_slice()
+                    [pos_in_chunk * value_len..(pos_in_chunk + 1) * value_len]
+                    .copy_from_slice(&encoding);
+            }
+
+            // Reduce via hash_layer_inplace.
+            let mut count = num_chunks;
+            while count > 1 {
+                count = Self::hash_layer_inplace(chunks, count);
+            }
+
+            chunks[0]
+        };
 
         *self.hash.write() = hash;
         hash
     }
 
-    pub fn empty() -> Self {
+    pub fn empty(subtree_depth: usize) -> Self {
+        let capacity = Self::capacity_for_subtree_depth(subtree_depth);
         PackedLeaf {
             hash: RwLock::new(Hash256::ZERO),
-            values: Vec::with_capacity(T::tree_hash_packing_factor()),
+            values: Vec::with_capacity(capacity),
         }
     }
 
-    pub fn single(value: T) -> Self {
-        let mut values = Vec::with_capacity(T::tree_hash_packing_factor());
+    pub fn single(value: T, subtree_depth: usize) -> Self {
+        let capacity = Self::capacity_for_subtree_depth(subtree_depth);
+        let mut values = Vec::with_capacity(capacity);
         values.push(value);
 
         PackedLeaf {
@@ -65,20 +123,29 @@ impl<T: TreeHash + Clone> PackedLeaf<T> {
         }
     }
 
-    pub fn repeat(value: T, n: usize) -> Self {
-        assert!(n <= T::tree_hash_packing_factor());
+    pub fn repeat(value: T, n: usize, subtree_depth: usize) -> Self {
+        let capacity = Self::capacity_for_subtree_depth(subtree_depth);
+        assert!(n <= capacity);
+        let mut values = Vec::with_capacity(capacity);
+        values.resize(n, value);
         PackedLeaf {
             hash: RwLock::new(Hash256::ZERO),
-            values: vec![value; n],
+            values,
         }
     }
 
-    pub fn insert_at_index(&self, index: usize, value: T) -> Result<Self, Error> {
+    pub fn insert_at_index(
+        &self,
+        index: usize,
+        value: T,
+        subtree_depth: usize,
+    ) -> Result<Self, Error> {
+        let capacity = Self::capacity_for_subtree_depth(subtree_depth);
         let mut updated = PackedLeaf {
             hash: RwLock::new(Hash256::ZERO),
             values: self.values.clone(),
         };
-        let sub_index = index % T::tree_hash_packing_factor();
+        let sub_index = index % capacity;
         updated.insert_mut(sub_index, value)?;
         Ok(updated)
     }
@@ -88,17 +155,18 @@ impl<T: TreeHash + Clone> PackedLeaf<T> {
         prefix: usize,
         hash: Hash256,
         updates: &U,
+        subtree_depth: usize,
     ) -> Result<Self, Error> {
+        let capacity = Self::capacity_for_subtree_depth(subtree_depth);
         let mut updated = PackedLeaf {
             hash: RwLock::new(hash),
             values: self.values.clone(),
         };
 
-        let packing_factor = T::tree_hash_packing_factor();
         let start = prefix;
-        let end = prefix + packing_factor;
+        let end = prefix + capacity;
         updates.for_each_range(start, end, |index, value| {
-            ControlFlow::Continue(updated.insert_mut(index % packing_factor, value.clone()))
+            ControlFlow::Continue(updated.insert_mut(index % capacity, value.clone()))
         })?;
         Ok(updated)
     }
@@ -120,8 +188,9 @@ impl<T: TreeHash + Clone> PackedLeaf<T> {
         Ok(())
     }
 
-    pub fn push(&mut self, value: T) -> Result<(), Error> {
-        if self.values.len() == T::tree_hash_packing_factor() {
+    pub fn push(&mut self, value: T, subtree_depth: usize) -> Result<(), Error> {
+        let capacity = Self::capacity_for_subtree_depth(subtree_depth);
+        if self.values.len() == capacity {
             return Err(Error::PackedLeafFull {
                 len: self.values.len(),
             });

@@ -1,9 +1,12 @@
+use crate::update_map::MaxMap;
 use crate::{List, Value, Vector};
 use context_deserialize::ContextDeserialize;
 use serde::de::Deserializer;
 use typenum::Unsigned;
+use vec_map::VecMap;
 
-impl<'de, C, T, N> ContextDeserialize<'de, C> for List<T, N>
+impl<'de, C, T, N, const MAX_SUBTREE_DEPTH: usize> ContextDeserialize<'de, C>
+    for List<T, N, MaxMap<VecMap<T>>, MAX_SUBTREE_DEPTH>
 where
     T: ContextDeserialize<'de, C> + Value,
     N: Unsigned,
@@ -24,7 +27,8 @@ where
     }
 }
 
-impl<'de, C, T, N> ContextDeserialize<'de, C> for Vector<T, N>
+impl<'de, C, T, N, const MAX_SUBTREE_DEPTH: usize> ContextDeserialize<'de, C>
+    for Vector<T, N, MaxMap<VecMap<T>>, MAX_SUBTREE_DEPTH>
 where
     T: ContextDeserialize<'de, C> + Value,
     N: Unsigned,
@@ -35,7 +39,10 @@ where
         D: Deserializer<'de>,
     {
         // First deserialize as a List
-        let list = List::<T, N>::context_deserialize(deserializer, context)?;
+        let list = List::<T, N, MaxMap<VecMap<T>>, MAX_SUBTREE_DEPTH>::context_deserialize(
+            deserializer,
+            context,
+        )?;
 
         // Then convert to Vector, which will check the length
         Vector::try_from(list).map_err(|e| {

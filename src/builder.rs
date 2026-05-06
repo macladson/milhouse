@@ -1,4 +1,7 @@
-use crate::utils::{Length, MaybeArced, opt_packing_depth, opt_packing_factor};
+use crate::utils::{
+    DEFAULT_SUBTREE_DEPTH, Length, MaybeArced, effective_subtree_depth, opt_packing_depth,
+    opt_packing_factor,
+};
 use crate::{Arc, Error, MAX_TREE_DEPTH, PackedLeaf, Tree, Value};
 
 #[derive(Debug)]
@@ -13,13 +16,25 @@ pub struct Builder<T: Value> {
     packing_factor: Option<usize>,
     /// Cached value of `opt_packing_depth`.
     packing_depth: usize,
+    /// Cached value of `effective_subtree_depth`.
+    subtree_depth: usize,
     /// Cached value of capacity: 2^(depth + packing_depth).
     capacity: usize,
 }
 
 impl<T: Value> Builder<T> {
-    pub fn new(depth: usize, level: usize) -> Result<Self, Error> {
-        let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
+    pub fn new(depth: usize, level: usize, log_n: usize) -> Result<Self, Error> {
+        Self::new_with_max_subtree_depth(depth, level, log_n, DEFAULT_SUBTREE_DEPTH)
+    }
+
+    pub fn new_with_max_subtree_depth(
+        depth: usize,
+        level: usize,
+        log_n: usize,
+        max_subtree_depth: usize,
+    ) -> Result<Self, Error> {
+        let packing_depth = opt_packing_depth::<T>(log_n, max_subtree_depth).unwrap_or(0);
+        let subtree_depth = effective_subtree_depth::<T>(log_n, max_subtree_depth);
         if depth.saturating_add(packing_depth) > MAX_TREE_DEPTH {
             Err(Error::BuilderInvalidDepth { depth })
         } else {
@@ -29,8 +44,9 @@ impl<T: Value> Builder<T> {
                 depth,
                 level,
                 length: Length(0),
-                packing_factor: opt_packing_factor::<T>(),
+                packing_factor: opt_packing_factor::<T>(log_n, max_subtree_depth),
                 packing_depth,
+                subtree_depth,
                 capacity,
             })
         }
@@ -46,9 +62,12 @@ impl<T: Value> Builder<T> {
         // Fold the nodes on the left of this node into it, and then push that node to the stack.
         let mut new_stack_top = if let Some(packing_factor) = self.packing_factor {
             if index.is_multiple_of(packing_factor) {
-                MaybeArced::Unarced(Tree::PackedLeaf(PackedLeaf::single(value)))
+                MaybeArced::Unarced(Tree::PackedLeaf(PackedLeaf::single(
+                    value,
+                    self.subtree_depth,
+                )))
             } else if let Some(MaybeArced::Unarced(Tree::PackedLeaf(mut leaf))) = self.stack.pop() {
-                leaf.push(value)?;
+                leaf.push(value, self.subtree_depth)?;
                 MaybeArced::Unarced(Tree::PackedLeaf(leaf))
             } else {
                 return Err(Error::BuilderExpectedLeaf);
@@ -109,7 +128,11 @@ impl<T: Value> Builder<T> {
 
     pub fn finish(mut self) -> Result<(Arc<Tree<T>>, usize, Length), Error> {
         if self.stack.is_empty() {
-            return Ok((Tree::zero(self.depth), self.depth, Length(0)));
+            return Ok((
+                Tree::packed_zero(self.depth, self.subtree_depth),
+                self.depth,
+                Length(0),
+            ));
         }
 
         let length = self.length.as_usize();
@@ -148,8 +171,10 @@ impl<T: Value> Builder<T> {
                 .saturating_sub(self.packing_depth);
 
             let stack_top = self.stack.pop().ok_or(Error::BuilderStackEmptyFinish)?;
-            let new_stack_top =
-                MaybeArced::Unarced(Tree::node_unboxed(stack_top.arced(), Tree::zero(depth)));
+            let new_stack_top = MaybeArced::Unarced(Tree::node_unboxed(
+                stack_top.arced(),
+                Tree::packed_zero(depth, self.subtree_depth),
+            ));
 
             self.stack.push(new_stack_top);
 
@@ -193,10 +218,20 @@ mod test {
 
     #[test]
     fn depth_upper_limit() {
+        let log_n = 64;
+        let packing_depth = opt_packing_depth::<u64>(log_n, DEFAULT_SUBTREE_DEPTH).unwrap();
+        let invalid_depth = MAX_TREE_DEPTH + 1 - packing_depth;
+        let valid_depth = MAX_TREE_DEPTH - packing_depth;
+
         assert_eq!(
-            Builder::<u64>::new(62, 0).unwrap_err(),
-            Error::BuilderInvalidDepth { depth: 62 }
+            Builder::<u64>::new(invalid_depth, 0, log_n).unwrap_err(),
+            Error::BuilderInvalidDepth {
+                depth: invalid_depth
+            }
         );
-        assert_eq!(Builder::<u64>::new(61, 0).unwrap().depth, 61);
+        assert_eq!(
+            Builder::<u64>::new(valid_depth, 0, log_n).unwrap().depth,
+            valid_depth
+        );
     }
 }

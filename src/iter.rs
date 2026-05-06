@@ -1,7 +1,4 @@
-use crate::{
-    Leaf, PackedLeaf, Tree, Value,
-    utils::{Length, opt_packing_depth, opt_packing_factor},
-};
+use crate::{Leaf, PackedLeaf, Tree, Value, utils::Length};
 
 #[derive(Debug)]
 pub struct Iter<'a, T: Value> {
@@ -11,18 +8,22 @@ pub struct Iter<'a, T: Value> {
     index: usize,
     /// The `depth` of the root tree.
     full_depth: usize,
-    /// Cached packing factor to avoid re-calculating `opt_packing_factor`.
-    ///
-    /// Initialised to 0 if `T` is not packed.
+    /// Cached packing factor: `1 << packing_depth`.
     packing_factor: usize,
-    /// Cached packing depth to avoid re-calculating `opt_packing_depth`.
+    /// Cached packing depth.
     packing_depth: usize,
     /// Number of items that will be yielded by the iterator.
     length: Length,
 }
 
 impl<'a, T: Value> Iter<'a, T> {
-    pub fn from_index(index: usize, root: &'a Tree<T>, depth: usize, length: Length) -> Self {
+    pub fn from_index(
+        index: usize,
+        root: &'a Tree<T>,
+        depth: usize,
+        length: Length,
+        packing_depth: usize,
+    ) -> Self {
         let mut stack = Vec::with_capacity(depth);
         stack.push(root);
 
@@ -30,8 +31,8 @@ impl<'a, T: Value> Iter<'a, T> {
             stack,
             index,
             full_depth: depth,
-            packing_factor: opt_packing_factor::<T>().unwrap_or(0),
-            packing_depth: opt_packing_depth::<T>().unwrap_or(0),
+            packing_factor: 1 << packing_depth,
+            packing_depth,
             length,
         }
     }
