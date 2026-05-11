@@ -4,7 +4,10 @@ use crate::iter::Iter;
 use crate::level_iter::LevelIter;
 use crate::tree::{IntraRebaseAction, RebaseAction};
 use crate::update_map::MaxMap;
-use crate::utils::Length;
+use crate::utils::{
+    DEFAULT_BRANCHING_FACTOR, DEFAULT_PACKED_LEAF_INTERNAL_DEPTH, Length,
+    effective_packed_leaf_depth, int_log,
+};
 use crate::{Arc, Cow, Error, List, Tree, UpdateMap, Value};
 #[cfg(feature = "arbitrary")]
 use arbitrary::Arbitrary;
@@ -20,8 +23,8 @@ use vec_map::VecMap;
 
 #[derive(Debug, Educe, Clone, Serialize, Deserialize)]
 #[educe(PartialEq(bound(T: Value, N: Unsigned, U: UpdateMap<T> + PartialEq)))]
-#[serde(try_from = "List<T, N, U>")]
-#[serde(into = "List<T, N, U>")]
+#[serde(try_from = "List<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>")]
+#[serde(into = "List<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>")]
 #[serde(bound(serialize = "T: Value + Serialize, N: Unsigned, U: UpdateMap<T>"))]
 #[serde(bound(deserialize = "T: Value + Deserialize<'de>, N: Unsigned, U: UpdateMap<T>"))]
 #[cfg_attr(
@@ -30,8 +33,15 @@ use vec_map::VecMap;
     arbitrary(bound = "T: Arbitrary<'arbitrary> + Value"),
     arbitrary(bound = "N: Unsigned, U: Arbitrary<'arbitrary> + UpdateMap<T>")
 )]
-pub struct Vector<T: Value, N: Unsigned, U: UpdateMap<T> = MaxMap<VecMap<T>>> {
-    pub(crate) interface: Interface<T, VectorInner<T, N>, U>,
+pub struct Vector<
+    T: Value,
+    N: Unsigned,
+    U: UpdateMap<T> = MaxMap<VecMap<T>>,
+    const BRANCHING_FACTOR: usize = DEFAULT_BRANCHING_FACTOR,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize = DEFAULT_PACKED_LEAF_INTERNAL_DEPTH,
+> {
+    pub(crate) interface:
+        Interface<T, VectorInner<T, N, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>, U>,
 }
 
 #[derive(Debug, Educe, Clone)]
@@ -41,7 +51,12 @@ pub struct Vector<T: Value, N: Unsigned, U: UpdateMap<T> = MaxMap<VecMap<T>>> {
     derive(Arbitrary),
     arbitrary(bound = "T: Arbitrary<'arbitrary> + Value, N: Unsigned")
 )]
-pub struct VectorInner<T: Value, N: Unsigned> {
+pub struct VectorInner<
+    T: Value,
+    N: Unsigned,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize = DEFAULT_PACKED_LEAF_INTERNAL_DEPTH,
+> {
     #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
     pub(crate) tree: Arc<Tree<T>>,
     pub(crate) depth: usize,
@@ -50,10 +65,28 @@ pub struct VectorInner<T: Value, N: Unsigned> {
     _phantom: PhantomData<N>,
 }
 
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
+impl<
+    T: Value,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     pub fn new(vec: Vec<T>) -> Result<Self, Error> {
+        const {
+            assert!(BRANCHING_FACTOR >= 2, "BRANCHING_FACTOR must be at least 2");
+            assert!(
+                BRANCHING_FACTOR.is_power_of_two(),
+                "BRANCHING_FACTOR must be a power of 2"
+            );
+            assert!(
+                PACKED_LEAF_INTERNAL_DEPTH <= 20,
+                "PACKED_LEAF_INTERNAL_DEPTH must not exceed 20"
+            )
+        };
         if vec.len() == N::to_usize() {
-            Self::try_from(List::new(vec)?)
+            Self::try_from(List::<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>::new(vec)?)
         } else {
             Err(Error::WrongVectorLength {
                 len: vec.len(),
@@ -63,11 +96,18 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
     }
 
     pub fn from_elem(elem: T) -> Result<Self, Error> {
-        Self::try_from(List::repeat(elem, N::to_usize())?)
+        Self::try_from(
+            List::<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>::repeat(
+                elem,
+                N::to_usize(),
+            )?,
+        )
     }
 
     pub fn try_from_iter(iter: impl IntoIterator<Item = T>) -> Result<Self, Error> {
-        Self::try_from(List::try_from_iter(iter)?)
+        Self::try_from(
+            List::<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>::try_from_iter(iter)?,
+        )
     }
 
     pub fn to_vec(&self) -> Vec<T> {
@@ -132,10 +172,20 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
     }
 }
 
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> TryFrom<List<T, N, U>> for Vector<T, N, U> {
+impl<
+    T: Value,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> TryFrom<List<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>>
+    for Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     type Error = Error;
 
-    fn try_from(list: List<T, N, U>) -> Result<Self, Error> {
+    fn try_from(
+        list: List<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>,
+    ) -> Result<Self, Error> {
         if list.len() == N::to_usize() {
             let updates = list.interface.updates;
             let backing = VectorInner {
@@ -160,7 +210,14 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> TryFrom<List<T, N, U>> for Vector<T
     }
 }
 
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
+impl<
+    T: Value,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     pub fn rebase(&self, base: &Self) -> Result<Self, Error> {
         let mut rebased = self.clone();
         rebased.rebase_on(base)?;
@@ -186,7 +243,14 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
     }
 }
 
-impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
+impl<
+    T: Value + Send + Sync,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     pub fn intra_rebase(&mut self) -> Result<(), Error> {
         // We need to be fully hashed in order to intra-rebase. To avoid putting this burden on the
         // caller, just do it here. If we're already fully-hashed this should be quick.
@@ -205,8 +269,16 @@ impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> Vector<T, N, U> {
     }
 }
 
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> From<Vector<T, N, U>> for List<T, N, U> {
-    fn from(vector: Vector<T, N, U>) -> Self {
+impl<
+    T: Value,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> From<Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>>
+    for List<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
+    fn from(vector: Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>) -> Self {
         let mut list = List::from_parts(
             vector.interface.backing.tree,
             vector.interface.backing.depth,
@@ -217,7 +289,17 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> From<Vector<T, N, U>> for List<T, N
     }
 }
 
-impl<T: Value, N: Unsigned> ImmList<T> for VectorInner<T, N> {
+impl<T: Value, N: Unsigned, const BRANCHING_FACTOR: usize, const PACKED_LEAF_INTERNAL_DEPTH: usize>
+    VectorInner<T, N, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
+    fn effective_packed_leaf_depth() -> usize {
+        effective_packed_leaf_depth::<T>(int_log(N::to_usize()), PACKED_LEAF_INTERNAL_DEPTH)
+    }
+}
+
+impl<T: Value, N: Unsigned, const BRANCHING_FACTOR: usize, const PACKED_LEAF_INTERNAL_DEPTH: usize>
+    ImmList<T> for VectorInner<T, N, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     fn get(&self, index: usize) -> Option<&T> {
         if index < self.len().as_usize() {
             self.tree
@@ -232,15 +314,29 @@ impl<T: Value, N: Unsigned> ImmList<T> for VectorInner<T, N> {
     }
 
     fn iter_from(&self, index: usize) -> Iter<'_, T> {
-        Iter::from_index(index, &self.tree, self.depth, Length(N::to_usize()))
+        Iter::from_index(
+            index,
+            &self.tree,
+            self.depth,
+            Length(N::to_usize()),
+            self.packing_depth,
+        )
     }
 
     fn level_iter_from(&self, index: usize) -> LevelIter<'_, T> {
-        LevelIter::from_index(index, &self.tree, self.depth, Length(N::to_usize()))
+        LevelIter::from_index(
+            index,
+            &self.tree,
+            self.depth,
+            Length(N::to_usize()),
+            self.packing_depth,
+            BRANCHING_FACTOR,
+        )
     }
 }
 
-impl<T, N> MutList<T> for VectorInner<T, N>
+impl<T, N, const BRANCHING_FACTOR: usize, const PACKED_LEAF_INTERNAL_DEPTH: usize> MutList<T>
+    for VectorInner<T, N, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
 where
     T: Value,
     N: Unsigned,
@@ -256,7 +352,14 @@ where
                 len: self.len().as_usize(),
             });
         }
-        self.tree = self.tree.with_updated_leaf(index, value, self.depth)?;
+        self.tree = self.tree.with_updated_leaf(
+            index,
+            value,
+            self.depth,
+            self.packing_depth,
+            Self::effective_packed_leaf_depth(),
+            BRANCHING_FACTOR,
+        )?;
         Ok(())
     }
 
@@ -273,14 +376,27 @@ where
             // Nothing to do.
             return Ok(());
         }
-        self.tree =
-            self.tree
-                .with_updated_leaves(&updates, 0, self.depth, hash_updates.as_ref())?;
+        self.tree = self.tree.with_updated_leaves(
+            &updates,
+            0,
+            self.depth,
+            hash_updates.as_ref(),
+            self.packing_depth,
+            Self::effective_packed_leaf_depth(),
+            BRANCHING_FACTOR,
+        )?;
         Ok(())
     }
 }
 
-impl<T: Default + Value, N: Unsigned, U: UpdateMap<T>> Default for Vector<T, N, U> {
+impl<
+    T: Default + Value,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> Default for Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     fn default() -> Self {
         Self::from_elem(T::default()).unwrap_or_else(|e| {
             panic!(
@@ -292,7 +408,14 @@ impl<T: Default + Value, N: Unsigned, U: UpdateMap<T>> Default for Vector<T, N, 
     }
 }
 
-impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> tree_hash::TreeHash for Vector<T, N, U> {
+impl<
+    T: Value + Send + Sync,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> tree_hash::TreeHash for Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     fn tree_hash_type() -> tree_hash::TreeHashType {
         tree_hash::TreeHashType::Vector
     }
@@ -308,11 +431,14 @@ impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> tree_hash::TreeHash f
     fn tree_hash_root(&self) -> Hash256 {
         // FIXME(sproul): remove assert
         assert!(!self.interface.has_pending_updates());
-        self.interface.backing.tree.tree_hash()
+        self.interface.backing.tree.tree_hash(
+            List::<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>::effective_packed_leaf_depth(),
+        )
     }
 }
 
-impl<T, N, U> TryFromIter<T> for Vector<T, N, U>
+impl<T, N, U, const BRANCHING_FACTOR: usize, const PACKED_LEAF_INTERNAL_DEPTH: usize> TryFromIter<T>
+    for Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
 where
     T: Value,
     N: Unsigned,
@@ -328,7 +454,15 @@ where
     }
 }
 
-impl<'a, T: Value, N: Unsigned, U: UpdateMap<T>> IntoIterator for &'a Vector<T, N, U> {
+impl<
+    'a,
+    T: Value,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> IntoIterator for &'a Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     type Item = &'a T;
     type IntoIter = InterfaceIter<'a, T, U>;
 
@@ -338,7 +472,14 @@ impl<'a, T: Value, N: Unsigned, U: UpdateMap<T>> IntoIterator for &'a Vector<T, 
 }
 
 // FIXME: duplicated from `ssz::encode::impl_for_vec`
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> Encode for Vector<T, N, U> {
+impl<
+    T: Value,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> Encode for Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     fn is_ssz_fixed_len() -> bool {
         <T as Encode>::is_ssz_fixed_len()
     }
@@ -380,7 +521,14 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Encode for Vector<T, N, U> {
     }
 }
 
-impl<T: Value, N: Unsigned, U: UpdateMap<T>> Decode for Vector<T, N, U> {
+impl<
+    T: Value,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> Decode for Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     fn is_ssz_fixed_len() -> bool {
         <T as Decode>::is_ssz_fixed_len()
     }
@@ -394,8 +542,11 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> Decode for Vector<T, N, U> {
     }
 
     fn from_ssz_bytes(bytes: &[u8]) -> Result<Self, ssz::DecodeError> {
-        let list = List::from_ssz_bytes(bytes)
-            .map_err(|e| ssz::DecodeError::BytesInvalid(format!("Error decoding vector: {e:?}")))?;
+        let list =
+            List::<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>::from_ssz_bytes(bytes)
+                .map_err(|e| {
+                    ssz::DecodeError::BytesInvalid(format!("Error decoding vector: {e:?}"))
+                })?;
         Self::try_from(list).map_err(|e| {
             ssz::DecodeError::BytesInvalid(format!("Wrong number of vector elements: {e:?}"))
         })

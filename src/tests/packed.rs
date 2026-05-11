@@ -1,7 +1,14 @@
+use crate::update_map::MaxMap;
 use crate::{List, Vector};
 use ssz_types::{FixedVector, VariableList};
 use tree_hash::TreeHash;
 use typenum::U16;
+use vec_map::VecMap;
+
+type ListWithDepth<const PACKED_LEAF_INTERNAL_DEPTH: usize> =
+    List<u64, U16, MaxMap<VecMap<u64>>, 2, PACKED_LEAF_INTERNAL_DEPTH>;
+type VectorWithDepth<const PACKED_LEAF_INTERNAL_DEPTH: usize> =
+    Vector<u64, U16, MaxMap<VecMap<u64>>, 2, PACKED_LEAF_INTERNAL_DEPTH>;
 
 #[test]
 fn u64_packed_list_build_and_iter() {
@@ -30,6 +37,20 @@ fn u64_packed_list_tree_hash() {
 }
 
 #[test]
+fn u64_packed_list_custom_packed_leaf_depths_tree_hash() {
+    for len in 0..=16u64 {
+        let vec = (0..len).map(|i| 2 * i).collect::<Vec<u64>>();
+        let shallow = ListWithDepth::<0>::new(vec.clone()).unwrap();
+        let deep = ListWithDepth::<5>::new(vec.clone()).unwrap();
+        let var_list = VariableList::<u64, U16>::new(vec).unwrap();
+
+        assert_eq!(shallow.tree_hash_root(), var_list.tree_hash_root());
+        assert_eq!(deep.tree_hash_root(), var_list.tree_hash_root());
+        assert_eq!(shallow.tree_hash_root(), deep.tree_hash_root());
+    }
+}
+
+#[test]
 fn u64_packed_vector_build_and_iter() {
     let len = 16;
 
@@ -52,6 +73,19 @@ fn u64_packed_vector_tree_hash() {
     let fixed_vector = FixedVector::<u64, U16>::new(vec).unwrap();
 
     assert_eq!(vector.tree_hash_root(), fixed_vector.tree_hash_root());
+}
+
+#[test]
+fn u64_packed_vector_custom_packed_leaf_depths_tree_hash() {
+    let len = 16;
+    let vec = (0..len).map(|i| 2 * i).collect::<Vec<u64>>();
+    let shallow = VectorWithDepth::<0>::new(vec.clone()).unwrap();
+    let deep = VectorWithDepth::<5>::new(vec.clone()).unwrap();
+    let fixed_vector = FixedVector::<u64, U16>::new(vec).unwrap();
+
+    assert_eq!(shallow.tree_hash_root(), fixed_vector.tree_hash_root());
+    assert_eq!(deep.tree_hash_root(), fixed_vector.tree_hash_root());
+    assert_eq!(shallow.tree_hash_root(), deep.tree_hash_root());
 }
 
 #[test]

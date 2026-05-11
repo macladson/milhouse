@@ -18,9 +18,9 @@ pub trait MemorySize {
 /// Memory usage (RAM) analysis for Milhouse data structures.
 #[derive(Debug, Default, Clone)]
 pub struct MemoryTracker {
-    // Map from pointer to size of subtree referenced by that pointer.
+    /// Map from pointer to size of subtree referenced by that pointer.
     subtree_sizes: HashMap<usize, usize>,
-    // Total size of all tracked items, accounting for de-duplication.
+    /// Total size of all tracked items, accounting for de-duplication.
     total_size: usize,
 }
 
@@ -47,7 +47,6 @@ impl MemoryTracker {
 
         // Otherwise, calculate the intrinsic size of this item, and recurse into its subtrees.
         let intrinsic_size = item.intrinsic_size();
-
         let subtrees = item.subtrees();
 
         let mut total_size = intrinsic_size;
@@ -98,10 +97,8 @@ impl<T: Value + MemorySize> MemorySize for Tree<T> {
 
     fn subtrees(&self) -> Vec<&dyn MemorySize> {
         match self {
-            // Recurse into left and right children.
-            Tree::Node { left, right, .. } => {
-                vec![left, right]
-            }
+            // Recurse into children.
+            Tree::Node { children, .. } => children.iter().map(|c| c as &dyn MemorySize).collect(),
             // To support nested size measurements we need to punch down into the leaves.
             // Use a reference to the `Arc` for the leaf so that the `Arc`'s intrinsic size is
             // counted.
@@ -114,18 +111,27 @@ impl<T: Value + MemorySize> MemorySize for Tree<T> {
     }
 
     fn intrinsic_size(&self) -> usize {
-        let leaf_size = match self {
+        let extra = match self {
             // This is the Vec<T> allocated inside `PackedLeaf::values`.
             Tree::PackedLeaf(packed) => packed.values.capacity() * std::mem::size_of::<T>(),
-            // The leaves and inner nodes will be visited separately so we don't need to count
+            // The boxed children slice allocation.
+            Tree::Node { children, .. } => children.len() * std::mem::size_of::<Arc<Self>>(),
+            // The leaves and zero nodes will be visited separately so we don't need to count
             // their intrinsic size here.
-            Tree::Leaf(_) | Tree::Node { .. } | Tree::Zero(..) => 0,
+            Tree::Leaf(_) | Tree::Zero(..) => 0,
         };
-        std::mem::size_of::<Self>() + leaf_size
+        std::mem::size_of::<Self>() + extra
     }
 }
 
-impl<T: Value + MemorySize, N: Unsigned, U: UpdateMap<T>> MemorySize for List<T, N, U> {
+impl<
+    T: Value + MemorySize,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> MemorySize for List<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     fn self_pointer(&self) -> usize {
         self as *const _ as usize
     }
@@ -136,13 +142,19 @@ impl<T: Value + MemorySize, N: Unsigned, U: UpdateMap<T>> MemorySize for List<T,
 
     fn intrinsic_size(&self) -> usize {
         // This approximates the size of the UpdateMap, and assumes that `T` is not recursive.
-        // We could probably add a `T: MemorySize` bound? In most practical cases the update map
-        // should be empty anyway.
+        // In most practical cases the update map should be empty anyway.
         std::mem::size_of::<Self>() + self.interface.updates.len() * std::mem::size_of::<T>()
     }
 }
 
-impl<T: Value + MemorySize, N: Unsigned, U: UpdateMap<T>> MemorySize for Vector<T, N, U> {
+impl<
+    T: Value + MemorySize,
+    N: Unsigned,
+    U: UpdateMap<T>,
+    const BRANCHING_FACTOR: usize,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize,
+> MemorySize for Vector<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     fn self_pointer(&self) -> usize {
         self as *const _ as usize
     }
@@ -152,8 +164,8 @@ impl<T: Value + MemorySize, N: Unsigned, U: UpdateMap<T>> MemorySize for Vector<
     }
 
     fn intrinsic_size(&self) -> usize {
-        // TODO(memsize): This approximates the size of the UpdateMap, and assumes that `T` is not
-        // recursive. In most practical cases the update map should be empty anyway.
+        // This approximates the size of the UpdateMap, and assumes that `T` is not recursive.
+        // In most practical cases the update map should be empty anyway.
         std::mem::size_of::<Self>() + self.interface.updates.len() * std::mem::size_of::<T>()
     }
 }
@@ -171,12 +183,12 @@ impl<const N: usize> MemorySize for FixedBytes<N> {
         std::mem::size_of::<Self>()
     }
 }
+
 /// Implement `MemorySize` for a basic type with no nested allocations.
 #[macro_export]
 macro_rules! impl_memory_size_for_basic_type {
     ($t:ty) => {
         impl MemorySize for $t {
-            // TODO(memsize): Make this optional? This sort of impl doesn't really make sense.
             fn self_pointer(&self) -> usize {
                 self as *const _ as usize
             }

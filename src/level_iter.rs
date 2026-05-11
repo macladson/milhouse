@@ -1,36 +1,26 @@
 use crate::{
     Arc, PackedLeaf, Tree, Value,
-    utils::{Length, compute_level, opt_packing_depth, opt_packing_factor},
+    utils::{Length, compute_level},
 };
 
 /// Iterator over the internal nodes at a given `depth` (level) in a tree.
 #[derive(Debug)]
 pub struct LevelIter<'a, T: Value> {
-    /// Stack of tree nodes corresponding to the current position.
-    stack: Vec<&'a Arc<Tree<T>>>,
+    /// Stack of (tree node, depth at this entry) pairs.
+    stack: Vec<(&'a Arc<Tree<T>>, usize)>,
     /// The list index corresponding to the current position (next element to be yielded).
-    ///
-    /// This is the index of the leaf/element at the bottom of the subtree.
     index: usize,
     /// The level of the tree being iterated.
     level: usize,
-    /// The `depth` of the root tree.
-    full_depth: usize,
-    /// Cached packing factor to avoid re-calculating `opt_packing_factor`.
-    ///
-    /// Initialised to 0 if `T` is not packed.
+    /// Cached packing factor: `1 << packing_depth`.
     packing_factor: usize,
-    /// Cached packing depth to avoid re-calculating `opt_packing_depth`.
+    /// Cached packing depth.
     packing_depth: usize,
     /// Number of elements in the list being iterated.
     length: Length,
 }
 
 /// Item yielded by a `LevelIter`.
-///
-/// If we are iterating an internal level, then all `Internal` nodes `Arc` pointers will be
-/// returned. Otherwise if we are iterating at the leaf level over packed leaves, references to
-/// leaves will be returned.
 #[derive(Debug)]
 pub enum LevelNode<'a, T: Value> {
     Internal(&'a Arc<Tree<T>>),
@@ -38,23 +28,74 @@ pub enum LevelNode<'a, T: Value> {
 }
 
 impl<'a, T: Value> LevelIter<'a, T> {
-    pub fn from_index(index: usize, root: &'a Arc<Tree<T>>, depth: usize, length: Length) -> Self {
+    pub fn from_index(
+        index: usize,
+        root: &'a Arc<Tree<T>>,
+        depth: usize,
+        length: Length,
+        packing_depth: usize,
+        branching_factor: usize,
+    ) -> Self {
+        let bf_log2 = branching_factor.trailing_zeros() as usize;
+        let mut level = compute_level(index, depth, packing_depth);
+
+        // Round level down to align with branching factor boundaries.
+        // Valid node depths are: D, D-F, D-2F, ..., D%F (where D=depth, F=bf_log2).
+        // In terms of levels (level = depth + packing_depth), valid levels are:
+        // packing_depth + D%F, packing_depth + D%F + F, ..., packing_depth + D
+        if bf_log2 >= 2 && level > packing_depth {
+            let target_depth = level - packing_depth;
+            // Valid depths are: D - k*F for k=0,1,...  i.e. D, D-F, D-2F, ..., D%F
+            // We want the largest valid depth <= target_depth.
+            // That is: D - ceil((D - target_depth) / F) * F
+            let k = depth.saturating_sub(target_depth).div_ceil(bf_log2);
+            let valid_depth = depth.saturating_sub(k * bf_log2);
+            level = packing_depth + valid_depth;
+        }
+
+        Self::from_index_at_level(index, root, depth, length, packing_depth, level)
+    }
+
+    /// Create a level iterator with an explicitly specified level.
+    pub fn from_index_at_level(
+        index: usize,
+        root: &'a Arc<Tree<T>>,
+        depth: usize,
+        length: Length,
+        packing_depth: usize,
+        level: usize,
+    ) -> Self {
         let mut stack = Vec::with_capacity(depth);
-        stack.push(root);
-
-        let packing_factor = opt_packing_factor::<T>().unwrap_or(0);
-        let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
-
-        let level = compute_level(index, depth, packing_depth);
+        stack.push((root, depth));
 
         LevelIter {
             stack,
             index,
             level,
-            full_depth: depth,
-            packing_factor,
+            packing_factor: 1 << packing_depth,
             packing_depth,
             length,
+        }
+    }
+
+    /// Backtrack by the given number of binary levels.
+    fn backtrack(&mut self, mut levels_to_ascend: usize) {
+        while levels_to_ascend > 0 {
+            match self.stack.last() {
+                Some((node, _)) => match node.as_ref() {
+                    Tree::Node { children, .. } => {
+                        let node_levels = children.len().trailing_zeros() as usize;
+                        if levels_to_ascend >= node_levels {
+                            self.stack.pop();
+                            levels_to_ascend -= node_levels;
+                        } else {
+                            break;
+                        }
+                    }
+                    _ => break,
+                },
+                None => break,
+            }
         }
     }
 }
@@ -67,40 +108,35 @@ impl<'a, T: Value> Iterator for LevelIter<'a, T> {
             return None;
         }
 
-        let node: &'a Arc<Tree<T>> = *self.stack.last()?;
+        let (node, depth) = *self.stack.last()?;
         match node.as_ref() {
             Tree::Zero(_) => None,
             Tree::Leaf(_) => {
                 let result = Some(LevelNode::Internal(node));
 
-                // If we are iterating leaves then the level must be 0.
                 debug_assert_eq!(self.level, 0);
                 self.index += 1;
 
-                // Backtrack to the parent node of the next subtree
-                for _ in 0..=self.index.trailing_zeros() {
-                    self.stack.pop();
-                }
+                self.stack.pop();
+                let levels = self.index.trailing_zeros() as usize;
+                self.backtrack(levels);
 
                 result
             }
             Tree::PackedLeaf(PackedLeaf { values, .. }) => {
-                let node_depth = self.full_depth + self.packing_depth - self.stack.len() + 1;
+                let node_depth = depth + self.packing_depth;
 
                 if node_depth == self.level {
                     let result = Some(LevelNode::Internal(node));
 
-                    // Jump to the next index on the same level.
                     self.index += 1 << self.level;
 
                     let trailing_zeros = self.index.trailing_zeros() as usize;
                     debug_assert!(trailing_zeros >= self.level);
-                    let to_pop = trailing_zeros.saturating_add(1).saturating_sub(self.level);
+                    let levels = trailing_zeros.saturating_sub(self.level);
 
-                    // Backtrack to the parent node of the next subtree
-                    for _ in 0..to_pop {
-                        self.stack.pop();
-                    }
+                    self.stack.pop();
+                    self.backtrack(levels);
 
                     return result;
                 }
@@ -108,52 +144,45 @@ impl<'a, T: Value> Iterator for LevelIter<'a, T> {
                 let sub_index = self.index % self.packing_factor;
                 let result = values.get(sub_index).map(LevelNode::PackedLeaf);
 
-                // If we are iterating leaves then the level must be 0.
                 debug_assert_eq!(self.level, 0);
                 self.index += 1;
 
-                // Reached end of chunk
                 if sub_index + 1 == self.packing_factor {
                     let to_pop = self
                         .index
                         .trailing_zeros()
                         .checked_sub(self.packing_depth as u32)
-                        .expect("index should have at least `packing_depth` trailing zeroes");
+                        .expect("index should have at least `packing_depth` trailing zeroes")
+                        as usize;
 
-                    for _ in 0..=to_pop {
-                        self.stack.pop();
-                    }
+                    self.stack.pop();
+                    self.backtrack(to_pop);
                 }
 
                 result
             }
-            Tree::Node { left, right, .. } => {
-                let child_depth = self.full_depth + self.packing_depth - self.stack.len();
-                let node_depth = child_depth + 1;
+            Tree::Node { children, .. } => {
+                let node_levels = children.len().trailing_zeros() as usize;
+                let new_depth = depth.saturating_sub(node_levels);
+                let node_depth = depth + self.packing_depth;
 
                 if node_depth == self.level {
                     let result = Some(LevelNode::Internal(node));
 
-                    // Jump to the next index on the same level.
                     self.index += 1 << self.level;
 
                     let trailing_zeros = self.index.trailing_zeros() as usize;
                     debug_assert!(trailing_zeros >= self.level);
-                    let to_pop = trailing_zeros.saturating_add(1).saturating_sub(self.level);
+                    let levels = trailing_zeros.saturating_sub(self.level);
 
-                    // Backtrack to the parent node of the next subtree
-                    for _ in 0..to_pop {
-                        self.stack.pop();
-                    }
+                    self.stack.pop();
+                    self.backtrack(levels);
 
                     result
-                } else if (self.index >> child_depth) & 1 == 0 {
-                    // Go left
-                    self.stack.push(left);
-                    self.next()
                 } else {
-                    // Go right
-                    self.stack.push(right);
+                    let child_index =
+                        (self.index >> (new_depth + self.packing_depth)) & (children.len() - 1);
+                    self.stack.push((&children[child_index], new_depth));
                     self.next()
                 }
             }

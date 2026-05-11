@@ -1,14 +1,25 @@
-use crate::{List, UpdateMap, Value};
+use crate::{
+    List, UpdateMap, Value,
+    utils::{DEFAULT_BRANCHING_FACTOR, DEFAULT_PACKED_LEAF_INTERNAL_DEPTH},
+};
 use itertools::process_results;
 use serde::Deserialize;
 use std::marker::PhantomData;
 use typenum::Unsigned;
 
-pub struct ListVisitor<T, N, U> {
+pub struct ListVisitor<
+    T,
+    N,
+    U,
+    const BRANCHING_FACTOR: usize = DEFAULT_BRANCHING_FACTOR,
+    const PACKED_LEAF_INTERNAL_DEPTH: usize = DEFAULT_PACKED_LEAF_INTERNAL_DEPTH,
+> {
     _phantom: PhantomData<(T, N, U)>,
 }
 
-impl<T, N, U> Default for ListVisitor<T, N, U> {
+impl<T, N, U, const BRANCHING_FACTOR: usize, const PACKED_LEAF_INTERNAL_DEPTH: usize> Default
+    for ListVisitor<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
+{
     fn default() -> Self {
         Self {
             _phantom: PhantomData,
@@ -16,13 +27,14 @@ impl<T, N, U> Default for ListVisitor<T, N, U> {
     }
 }
 
-impl<'a, T, N, U> serde::de::Visitor<'a> for ListVisitor<T, N, U>
+impl<'a, T, N, U, const BRANCHING_FACTOR: usize, const PACKED_LEAF_INTERNAL_DEPTH: usize>
+    serde::de::Visitor<'a> for ListVisitor<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>
 where
     T: Deserialize<'a> + Value,
     N: Unsigned,
     U: UpdateMap<T>,
 {
-    type Value = List<T, N, U>;
+    type Value = List<T, N, U, BRANCHING_FACTOR, PACKED_LEAF_INTERNAL_DEPTH>;
 
     fn expecting(&self, formatter: &mut std::fmt::Formatter) -> std::fmt::Result {
         write!(formatter, "a list of T")

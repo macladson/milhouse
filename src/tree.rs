@@ -1,4 +1,4 @@
-use crate::utils::{Length, opt_hash, opt_packing_depth, opt_packing_factor};
+use crate::utils::{Length, opt_hash};
 use crate::{Arc, Error, Leaf, PackedLeaf, UpdateMap, Value};
 use educe::Educe;
 use ethereum_hashing::{ZERO_HASHES, hash32_concat};
@@ -14,28 +14,31 @@ use tree_hash::Hash256;
 pub enum Tree<T: Value> {
     Leaf(Leaf<T>),
     PackedLeaf(PackedLeaf<T>),
+    /// An intermediate node with `2^k` children (k >= 1).
+    ///
+    /// When k=1, this is a standard binary node (2 children).
+    /// When k>1, this is a wide node that absorbs multiple binary tree levels.
+    /// The number of children is always a power of 2.
     Node {
         #[educe(PartialEq(ignore), Hash(ignore))]
         #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_rwlock))]
         hash: RwLock<Hash256>,
-        #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
-        left: Arc<Self>,
-        #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_arc))]
-        right: Arc<Self>,
+        #[cfg_attr(feature = "arbitrary", arbitrary(with = crate::utils::arb_node_children))]
+        children: Box<[Arc<Self>]>,
     },
+    /// A subtree of all zeros. The `usize` is the depth of the zero subtree.
     Zero(usize),
 }
 
 impl<T: Value> Clone for Tree<T> {
     fn clone(&self) -> Self {
         match self {
-            Self::Node { hash, left, right } => Self::Node {
-                hash: RwLock::new(*hash.read()),
-                left: left.clone(),
-                right: right.clone(),
-            },
             Self::Leaf(leaf) => Self::Leaf(leaf.clone()),
             Self::PackedLeaf(leaf) => Self::PackedLeaf(leaf.clone()),
+            Self::Node { hash, children } => Self::Node {
+                hash: RwLock::new(*hash.read()),
+                children: children.clone(),
+            },
             Self::Zero(depth) => Self::Zero(*depth),
         }
     }
@@ -46,16 +49,26 @@ impl<T: Value> Tree<T> {
         Self::zero(depth)
     }
 
-    pub fn node(left: Arc<Self>, right: Arc<Self>, hash: Hash256) -> Arc<Self> {
+    /// Create an intermediate node from a boxed slice of children.
+    pub fn node(children: Box<[Arc<Self>]>, hash: Hash256) -> Arc<Self> {
         Arc::new(Self::Node {
             hash: RwLock::new(hash),
-            left,
-            right,
+            children,
         })
+    }
+
+    /// Create a binary (2-child) intermediate node.
+    pub fn binary_node(left: Arc<Self>, right: Arc<Self>, hash: Hash256) -> Arc<Self> {
+        Self::node(Box::new([left, right]), hash)
     }
 
     pub fn zero(depth: usize) -> Arc<Self> {
         Arc::new(Self::Zero(depth))
+    }
+
+    /// Create a zero node at a position where a `PackedLeaf` would appear.
+    pub fn packed_zero(logical_depth: usize, packed_leaf_depth: usize) -> Arc<Self> {
+        Arc::new(Self::Zero(logical_depth + packed_leaf_depth))
     }
 
     pub fn leaf(value: T) -> Arc<Self> {
@@ -66,11 +79,11 @@ impl<T: Value> Tree<T> {
         Arc::new(Self::Leaf(Leaf::with_hash(value, hash)))
     }
 
+    /// Create an unboxed binary node (for builder stack usage).
     pub fn node_unboxed(left: Arc<Self>, right: Arc<Self>) -> Self {
         Self::Node {
             hash: RwLock::new(Hash256::ZERO),
-            left,
-            right,
+            children: Box::new([left, right]),
         }
     }
 
@@ -86,18 +99,13 @@ impl<T: Value> Tree<T> {
         match self {
             Self::Leaf(Leaf { value, .. }) if depth == 0 => Some(value),
             Self::PackedLeaf(PackedLeaf { values, .. }) if depth == 0 => {
-                values.get(index % T::tree_hash_packing_factor())
+                values.get(index % (1 << packing_depth))
             }
-            Self::Node { left, right, .. } if depth > 0 => {
-                let new_depth = depth - 1;
-                // Left
-                if (index >> (new_depth + packing_depth)) & 1 == 0 {
-                    left.get_recursive(index, new_depth, packing_depth)
-                }
-                // Right
-                else {
-                    right.get_recursive(index, new_depth, packing_depth)
-                }
+            Self::Node { children, .. } if depth > 0 => {
+                let node_levels = children.len().trailing_zeros() as usize;
+                let new_depth = depth - node_levels;
+                let child_index = (index >> (new_depth + packing_depth)) & (children.len() - 1);
+                children[child_index].get_recursive(index, new_depth, packing_depth)
             }
             _ => None,
         }
@@ -105,63 +113,87 @@ impl<T: Value> Tree<T> {
 
     /// Create a new tree where the `index`th leaf is set to `new_value`.
     ///
-    /// NOTE: callers are responsible for bounds-checking `index` before calling this function.
+    /// `branching_factor` controls the width of nodes created when splitting Zero nodes.
+    /// It is the desired number of children (must be a power of two, at least 2).
+    /// The width at any depth `d` is `min(branching_factor, 2^d)`.
     pub fn with_updated_leaf(
         &self,
         index: usize,
         new_value: T,
         depth: usize,
+        packing_depth: usize,
+        packed_leaf_depth: usize,
+        branching_factor: usize,
     ) -> Result<Arc<Self>, Error> {
+        let bf_log2 = branching_factor.trailing_zeros() as usize;
         match self {
             Self::Leaf(_) if depth == 0 => Ok(Self::leaf(new_value)),
             Self::PackedLeaf(leaf) if depth == 0 => Ok(Arc::new(Self::PackedLeaf(
-                leaf.insert_at_index(index, new_value)?,
+                leaf.insert_at_index(index, new_value, packed_leaf_depth)?,
             ))),
-            Self::Node { left, right, .. } if depth > 0 => {
-                let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
-                let new_depth = depth - 1;
-                if (index >> (new_depth + packing_depth)) & 1 == 0 {
-                    // Index lies on the left, recurse left
-                    Ok(Self::node(
-                        left.with_updated_leaf(index, new_value, new_depth)?,
-                        right.clone(),
-                        Hash256::ZERO,
-                    ))
-                } else {
-                    // Index lies on the right, recurse right
-                    Ok(Self::node(
-                        left.clone(),
-                        right.with_updated_leaf(index, new_value, new_depth)?,
-                        Hash256::ZERO,
-                    ))
-                }
+            Self::Node { children, .. } if depth > 0 => {
+                let node_levels = children.len().trailing_zeros() as usize;
+                let new_depth = depth - node_levels;
+                let child_index = (index >> (new_depth + packing_depth)) & (children.len() - 1);
+                let mut new_children = children.clone();
+                new_children[child_index] = children[child_index].with_updated_leaf(
+                    index,
+                    new_value,
+                    new_depth,
+                    packing_depth,
+                    packed_leaf_depth,
+                    branching_factor,
+                )?;
+                Ok(Self::node(new_children, Hash256::ZERO))
             }
-            Self::Zero(zero_depth) if *zero_depth == depth => {
+            Self::Zero(zero_depth) if *zero_depth == depth + packed_leaf_depth => {
                 if depth == 0 {
-                    if opt_packing_factor::<T>().is_some() {
-                        Ok(Arc::new(Self::PackedLeaf(PackedLeaf::single(new_value))))
+                    if packing_depth > 0 {
+                        Ok(Arc::new(Self::PackedLeaf(PackedLeaf::single(
+                            new_value,
+                            packed_leaf_depth,
+                        ))))
                     } else {
                         Ok(Self::leaf(new_value))
                     }
                 } else {
-                    // Split zero node into a node with left and right, and recurse into
-                    // the appropriate subtree
-                    let new_zero = Self::zero(depth - 1);
-                    Self::node(new_zero.clone(), new_zero, Hash256::ZERO)
-                        .with_updated_leaf(index, new_value, depth)
+                    // Split zero node into a node of the correct width.
+                    // Width = min(branching_factor, 2^depth).
+                    let width_exp = std::cmp::min(bf_log2, depth);
+                    let child_zero_depth = (depth - width_exp) + packed_leaf_depth;
+                    let width = 1usize << width_exp;
+                    let children: Box<[Arc<Self>]> =
+                        (0..width).map(|_| Self::zero(child_zero_depth)).collect();
+                    let node = Arc::new(Self::Node {
+                        hash: RwLock::new(Hash256::ZERO),
+                        children,
+                    });
+                    node.with_updated_leaf(
+                        index,
+                        new_value,
+                        depth,
+                        packing_depth,
+                        packed_leaf_depth,
+                        branching_factor,
+                    )
                 }
             }
             _ => Err(Error::UpdateLeafError),
         }
     }
 
+    #[allow(clippy::too_many_arguments)]
     pub fn with_updated_leaves<U: UpdateMap<T>>(
         &self,
         updates: &U,
         prefix: usize,
         depth: usize,
         hashes: Option<&BTreeMap<(usize, usize), Hash256>>,
+        packing_depth: usize,
+        packed_leaf_depth: usize,
+        branching_factor: usize,
     ) -> Result<Arc<Self>, Error> {
+        let bf_log2 = branching_factor.trailing_zeros() as usize;
         let hash = opt_hash(hashes, depth, prefix).unwrap_or_default();
 
         match self {
@@ -174,48 +206,55 @@ impl<T: Value> Tree<T> {
                 Ok(Self::leaf_with_hash(value, hash))
             }
             Self::PackedLeaf(packed_leaf) if depth == 0 => Ok(Arc::new(Self::PackedLeaf(
-                packed_leaf.update(prefix, hash, updates)?,
+                packed_leaf.update(prefix, hash, updates, packed_leaf_depth)?,
             ))),
-            Self::Node { left, right, .. } if depth > 0 => {
-                let packing_depth = opt_packing_depth::<T>().unwrap_or(0);
-                let new_depth = depth - 1;
-                let left_prefix = prefix;
-                let right_prefix = prefix | (1 << (new_depth + packing_depth));
-                let right_subtree_end = prefix + (1 << (depth + packing_depth));
+            Self::Node { children, .. } if depth > 0 => {
+                let node_levels = children.len().trailing_zeros() as usize;
+                let num_children = children.len();
+                let new_depth = depth - node_levels;
 
-                let mut has_left_updates = false;
-                updates.for_each_range(left_prefix, right_prefix, |_, _| {
-                    has_left_updates = true;
-                    ControlFlow::Break(())
-                })?;
-                let mut has_right_updates = false;
-                updates.for_each_range(right_prefix, right_subtree_end, |_, _| {
-                    has_right_updates = true;
-                    ControlFlow::Break(())
-                })?;
+                let mut new_children = children.clone();
+                let mut any_updated = false;
 
-                // Must have some updates else this recursive branch is a complete waste of time.
-                if !has_left_updates && !has_right_updates {
+                for i in 0..num_children {
+                    let child_prefix = prefix | (i << (new_depth + packing_depth));
+                    let child_end = child_prefix + (1 << (new_depth + packing_depth));
+
+                    let mut has_updates = false;
+                    updates.for_each_range(child_prefix, child_end, |_, _| {
+                        has_updates = true;
+                        ControlFlow::Break(())
+                    })?;
+
+                    if has_updates {
+                        new_children[i] = children[i].with_updated_leaves(
+                            updates,
+                            child_prefix,
+                            new_depth,
+                            hashes,
+                            packing_depth,
+                            packed_leaf_depth,
+                            branching_factor,
+                        )?;
+                        any_updated = true;
+                    }
+                }
+
+                if !any_updated {
                     return Err(Error::NodeUpdatesMissing { prefix });
                 }
 
-                let new_left = if has_left_updates {
-                    left.with_updated_leaves(updates, left_prefix, new_depth, hashes)?
-                } else {
-                    left.clone()
-                };
-                let new_right = if has_right_updates {
-                    right.with_updated_leaves(updates, right_prefix, new_depth, hashes)?
-                } else {
-                    right.clone()
-                };
-
-                Ok(Self::node(new_left, new_right, hash))
+                Ok(Self::node(new_children, hash))
             }
-            Self::Zero(zero_depth) if *zero_depth == depth => {
+            Self::Zero(zero_depth) if *zero_depth == depth + packed_leaf_depth => {
                 if depth == 0 {
-                    if opt_packing_factor::<T>().is_some() {
-                        let packed_leaf = PackedLeaf::empty().update(prefix, hash, updates)?;
+                    if packing_depth > 0 {
+                        let packed_leaf = PackedLeaf::empty(packed_leaf_depth).update(
+                            prefix,
+                            hash,
+                            updates,
+                            packed_leaf_depth,
+                        )?;
                         Ok(Arc::new(Self::PackedLeaf(packed_leaf)))
                     } else {
                         let index = prefix;
@@ -226,10 +265,25 @@ impl<T: Value> Tree<T> {
                         Ok(Self::leaf_with_hash(value, hash))
                     }
                 } else {
-                    // Split zero node into a node with left and right and recurse.
-                    let new_zero = Self::zero(depth - 1);
-                    Self::node(new_zero.clone(), new_zero, hash)
-                        .with_updated_leaves(updates, prefix, depth, hashes)
+                    // Split zero into a node of the correct width and recurse.
+                    let width_exp = std::cmp::min(bf_log2, depth);
+                    let child_zero_depth = (depth - width_exp) + packed_leaf_depth;
+                    let width = 1usize << width_exp;
+                    let children: Box<[Arc<Self>]> =
+                        (0..width).map(|_| Self::zero(child_zero_depth)).collect();
+                    let node = Self::Node {
+                        hash: RwLock::new(Hash256::ZERO),
+                        children,
+                    };
+                    node.with_updated_leaves(
+                        updates,
+                        prefix,
+                        depth,
+                        hashes,
+                        packing_depth,
+                        packed_leaf_depth,
+                        branching_factor,
+                    )
                 }
             }
             _ => Err(Error::UpdateLeavesError),
@@ -244,20 +298,20 @@ impl<T: Value> Tree<T> {
         match self {
             Self::Leaf(_) => 1,
             Self::PackedLeaf(leaf) => leaf.values.len(),
-            Self::Node { left, right, .. } => left.compute_len() + right.compute_len(),
+            Self::Node { children, .. } => children.iter().map(|c| c.compute_len()).sum(),
             Self::Zero(_) => 0,
         }
     }
 }
 
 pub enum RebaseAction<'a, T> {
-    // Not equal and no changes in parent nodes required.
+    /// Nodes are not equal: no replacement needed.
     NotEqualNoop,
-    // Not equal, but `new` should be replaced by the given node.
+    /// Nodes are not equal: replacement with a new constructed node.
     NotEqualReplace(Arc<T>),
-    // Nodes are already exactly equal and pointer equal.
+    /// Nodes are equal: no replacement needed (already pointer-equal or structurally identical).
     EqualNoop,
-    // Nodes are exactly equal and `new` should be replaced by the given node.
+    /// Nodes are equal: replacement with the base node (for structural sharing).
     EqualReplace(&'a Arc<T>),
 }
 
@@ -285,7 +339,7 @@ impl<T: Value> Tree<T> {
                 }
             }
             (Self::PackedLeaf(l1), Self::PackedLeaf(l2)) => {
-                if l1.values == l2.values {
+                if l1 == l2 {
                     Ok(RebaseAction::EqualReplace(base))
                 } else {
                     Ok(RebaseAction::NotEqualNoop)
@@ -295,15 +349,13 @@ impl<T: Value> Tree<T> {
             (
                 Self::Node {
                     hash: orig_hash_lock,
-                    left: l1,
-                    right: r1,
+                    children: c1,
                 },
                 Self::Node {
                     hash: base_hash_lock,
-                    left: l2,
-                    right: r2,
+                    children: c2,
                 },
-            ) if full_depth > 0 => {
+            ) if c1.len() == c2.len() && full_depth > 0 => {
                 use RebaseAction::*;
 
                 let orig_hash = *orig_hash_lock.read();
@@ -319,87 +371,64 @@ impl<T: Value> Tree<T> {
                     return Ok(EqualReplace(base));
                 }
 
-                let new_full_depth = full_depth - 1;
-                let (left_lengths, right_lengths) = lengths
-                    .map(|(orig_length, base_length)| {
-                        let max_left_length = Length(1 << new_full_depth);
-                        let orig_left_length = std::cmp::min(orig_length, max_left_length);
-                        let orig_right_length =
-                            Length(orig_length.as_usize() - orig_left_length.as_usize());
+                let node_levels = c1.len().trailing_zeros() as usize;
+                let new_full_depth = full_depth - node_levels;
 
-                        let base_left_length = std::cmp::min(base_length, max_left_length);
-                        let base_right_length =
-                            Length(base_length.as_usize() - base_left_length.as_usize());
-                        (
-                            (orig_left_length, base_left_length),
-                            (orig_right_length, base_right_length),
-                        )
-                    })
-                    .unzip();
+                let mut any_replaced = false;
+                let mut all_equal = true;
+                let mut new_children = c1.clone();
 
-                let left_action = Tree::rebase_on(l1, l2, left_lengths, new_full_depth)?;
-                let right_action = Tree::rebase_on(r1, r2, right_lengths, new_full_depth)?;
+                for i in 0..c1.len() {
+                    let child_lengths = lengths.map(|(orig_length, base_length)| {
+                        let child_capacity = 1usize << new_full_depth;
+                        let child_offset = i * child_capacity;
+                        let orig_child_len = Length(
+                            orig_length
+                                .as_usize()
+                                .saturating_sub(child_offset)
+                                .min(child_capacity),
+                        );
+                        let base_child_len = Length(
+                            base_length
+                                .as_usize()
+                                .saturating_sub(child_offset)
+                                .min(child_capacity),
+                        );
+                        (orig_child_len, base_child_len)
+                    });
 
-                match (left_action, right_action) {
-                    (NotEqualNoop, NotEqualNoop | EqualNoop) | (EqualNoop, NotEqualNoop) => {
-                        Ok(NotEqualNoop)
+                    match Tree::rebase_on(&c1[i], &c2[i], child_lengths, new_full_depth)? {
+                        EqualReplace(r) => {
+                            new_children[i] = r.clone();
+                            any_replaced = true;
+                        }
+                        NotEqualReplace(r) => {
+                            new_children[i] = r;
+                            any_replaced = true;
+                            all_equal = false;
+                        }
+                        EqualNoop => {}
+                        NotEqualNoop => {
+                            all_equal = false;
+                        }
                     }
-                    (EqualNoop, EqualNoop) => Ok(EqualNoop),
-                    (NotEqualNoop | EqualNoop, NotEqualReplace(new_right)) => {
-                        Ok(NotEqualReplace(Arc::new(Self::Node {
-                            hash: RwLock::new(orig_hash),
-                            left: l1.clone(),
-                            right: new_right,
-                        })))
-                    }
-                    (NotEqualNoop | EqualNoop, EqualReplace(new_right)) => {
-                        Ok(NotEqualReplace(Arc::new(Self::Node {
-                            hash: RwLock::new(orig_hash),
-                            left: l1.clone(),
-                            right: new_right.clone(),
-                        })))
-                    }
-                    (NotEqualReplace(new_left), NotEqualNoop | EqualNoop) => {
-                        Ok(NotEqualReplace(Arc::new(Self::Node {
-                            hash: RwLock::new(orig_hash),
-                            left: new_left,
-                            right: r1.clone(),
-                        })))
-                    }
-                    (NotEqualReplace(new_left), NotEqualReplace(new_right)) => {
-                        Ok(NotEqualReplace(Arc::new(Self::Node {
-                            hash: RwLock::new(orig_hash),
-                            left: new_left,
-                            right: new_right,
-                        })))
-                    }
-                    (NotEqualReplace(new_left), EqualReplace(new_right)) => {
-                        Ok(NotEqualReplace(Arc::new(Self::Node {
-                            hash: RwLock::new(orig_hash),
-                            left: new_left,
-                            right: new_right.clone(),
-                        })))
-                    }
-                    (EqualReplace(new_left), NotEqualNoop) => {
-                        Ok(NotEqualReplace(Arc::new(Self::Node {
-                            hash: RwLock::new(orig_hash),
-                            left: new_left.clone(),
-                            right: r1.clone(),
-                        })))
-                    }
-                    (EqualReplace(new_left), NotEqualReplace(new_right)) => {
-                        Ok(NotEqualReplace(Arc::new(Self::Node {
-                            hash: RwLock::new(orig_hash),
-                            left: new_left.clone(),
-                            right: new_right,
-                        })))
-                    }
-                    (EqualReplace(_), EqualReplace(_)) | (EqualReplace(_), EqualNoop) => {
-                        Ok(EqualReplace(base))
-                    }
+                }
+
+                if all_equal && !any_replaced {
+                    Ok(EqualNoop)
+                } else if all_equal {
+                    Ok(EqualReplace(base))
+                } else if any_replaced {
+                    Ok(NotEqualReplace(Arc::new(Self::Node {
+                        hash: RwLock::new(orig_hash),
+                        children: new_children,
+                    })))
+                } else {
+                    Ok(NotEqualNoop)
                 }
             }
             (Self::Zero(_), _) | (_, Self::Zero(_)) => Ok(RebaseAction::NotEqualNoop),
+            // Mismatched node widths or depth=0 nodes
             (Self::Node { .. }, Self::Node { .. }) => Err(Error::InvalidRebaseNode),
             (Self::Leaf(_) | Self::PackedLeaf(_), _) | (_, Self::Leaf(_) | Self::PackedLeaf(_)) => {
                 Err(Error::InvalidRebaseLeaf)
@@ -437,50 +466,49 @@ impl<T: Value> Tree<T> {
     ) -> Result<IntraRebaseAction<Self>, Error> {
         match &**orig {
             Self::Leaf(_) | Self::PackedLeaf(_) | Self::Zero(_) => Ok(IntraRebaseAction::Noop),
-            Self::Node { hash, left, right } if current_depth > 0 => {
-                let hash = *hash.read();
+            Self::Node { hash, children } if current_depth > 0 => {
+                let hash_val = *hash.read();
 
                 // Tree must be fully hashed prior to intra-rebase.
-                if hash.is_zero() {
+                if hash_val.is_zero() {
                     return Err(Error::IntraRebaseZeroHash);
                 }
 
-                if let Some(known_subtree) = known_subtrees.get(&(current_depth, hash)) {
-                    // Node is already known from elsewhere in the tree. We can replace it without
-                    // looking at further subtrees.
-                    return Ok(IntraRebaseAction::Replace(known_subtree.clone()));
+                if let Some(known) = known_subtrees.get(&(current_depth, hash_val)) {
+                    return Ok(IntraRebaseAction::Replace(known.clone()));
                 }
 
-                let left_action = Self::intra_rebase(left, known_subtrees, current_depth - 1)?;
-                let right_action = Self::intra_rebase(right, known_subtrees, current_depth - 1)?;
+                let node_levels = children.len().trailing_zeros() as usize;
+                let child_depth = current_depth - node_levels;
 
-                let action = match (left_action, right_action) {
-                    (IntraRebaseAction::Noop, IntraRebaseAction::Noop) => IntraRebaseAction::Noop,
-                    (IntraRebaseAction::Noop, IntraRebaseAction::Replace(new_right)) => {
-                        IntraRebaseAction::Replace(Self::node(left.clone(), new_right, hash))
+                let mut any_replaced = false;
+                let mut new_children = children.clone();
+
+                for i in 0..children.len() {
+                    match Self::intra_rebase(&children[i], known_subtrees, child_depth)? {
+                        IntraRebaseAction::Noop => {}
+                        IntraRebaseAction::Replace(new_child) => {
+                            new_children[i] = new_child;
+                            any_replaced = true;
+                        }
                     }
-                    (IntraRebaseAction::Replace(new_left), IntraRebaseAction::Noop) => {
-                        IntraRebaseAction::Replace(Self::node(new_left, right.clone(), hash))
-                    }
-                    (
-                        IntraRebaseAction::Replace(new_left),
-                        IntraRebaseAction::Replace(new_right),
-                    ) => IntraRebaseAction::Replace(Self::node(new_left, new_right, hash)),
+                }
+
+                let action = if any_replaced {
+                    IntraRebaseAction::Replace(Self::node(new_children, hash_val))
+                } else {
+                    IntraRebaseAction::Noop
                 };
 
-                // Add the new version of this node to the known subtrees.
                 let new_subtree = match &action {
-                    // `orig` has not been seen in this traversal and will not change, so we add it
-                    // to the map.
                     IntraRebaseAction::Noop => orig.clone(),
                     IntraRebaseAction::Replace(new) => new.clone(),
                 };
-                let existing_entry = known_subtrees.insert((current_depth, hash), new_subtree);
 
-                // We should not add any identical node to the `known_subtrees` more than once.
-                // This indicates an error in this method's implementation or the map passed in not
-                // being empty.
-                if existing_entry.is_some() {
+                if known_subtrees
+                    .insert((current_depth, hash_val), new_subtree)
+                    .is_some()
+                {
                     return Err(Error::IntraRebaseRepeatVisit);
                 }
 
@@ -492,7 +520,7 @@ impl<T: Value> Tree<T> {
 }
 
 impl<T: Value + Send + Sync> Tree<T> {
-    pub fn tree_hash(&self) -> Hash256 {
+    pub(crate) fn tree_hash(&self, packed_leaf_depth: usize) -> Hash256 {
         match self {
             Self::Leaf(Leaf { hash, value }) => {
                 // FIXME(sproul): upgradeable RwLock?
@@ -515,21 +543,67 @@ impl<T: Value + Send + Sync> Tree<T> {
                     tree_hash
                 }
             }
-            Self::PackedLeaf(leaf) => leaf.tree_hash(),
+            Self::PackedLeaf(leaf) => leaf.tree_hash(packed_leaf_depth),
             Self::Zero(depth) => Hash256::from(ZERO_HASHES[*depth]),
-            Self::Node { hash, left, right } => {
+            Self::Node { hash, children } => {
                 let read_lock = hash.read();
                 let existing_hash = *read_lock;
                 drop(read_lock);
 
                 if !existing_hash.is_zero() {
-                    existing_hash
-                } else {
-                    // Parallelism goes brrrr.
-                    let (left_hash, right_hash) =
-                        rayon::join(|| left.tree_hash(), || right.tree_hash());
+                    return existing_hash;
+                }
+
+                let num_children = children.len();
+
+                if num_children == 2 {
+                    // Binary node: use rayon::join for top-level parallelism
+                    let (left_hash, right_hash) = rayon::join(
+                        || children[0].tree_hash(packed_leaf_depth),
+                        || children[1].tree_hash(packed_leaf_depth),
+                    );
                     let tree_hash =
                         Hash256::from(hash32_concat(left_hash.as_slice(), right_hash.as_slice()));
+                    *hash.write() = tree_hash;
+                    tree_hash
+                } else {
+                    let node_levels = num_children.trailing_zeros() as usize;
+
+                    let mut heap_buf;
+                    let mut stack_buf = [Hash256::ZERO; 16];
+                    // If branching factor <= 16, keep all hashes on the stack.
+                    let buf: &mut [Hash256] = if num_children <= 16 {
+                        &mut stack_buf[..num_children]
+                    } else {
+                        heap_buf = vec![Hash256::ZERO; num_children];
+                        &mut heap_buf[..]
+                    };
+
+                    if num_children >= 4 {
+                        use rayon::prelude::*;
+                        buf[..num_children]
+                            .par_iter_mut()
+                            .zip(children.par_iter())
+                            .for_each(|(dest, child)| {
+                                *dest = child.tree_hash(packed_leaf_depth);
+                            });
+                    } else {
+                        for (i, child) in children.iter().enumerate() {
+                            buf[i] = child.tree_hash(packed_leaf_depth);
+                        }
+                    }
+
+                    let mut count = num_children;
+                    for _ in 0..node_levels {
+                        let pairs = count / 2;
+                        for i in 0..pairs {
+                            let h = hash32_concat(buf[2 * i].as_slice(), buf[2 * i + 1].as_slice());
+                            buf[i] = Hash256::from(h);
+                        }
+                        count = pairs;
+                    }
+
+                    let tree_hash = buf[0];
                     *hash.write() = tree_hash;
                     tree_hash
                 }
