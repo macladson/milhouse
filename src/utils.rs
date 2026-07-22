@@ -89,6 +89,53 @@ pub fn updated_length<U: UpdateMap<T>, T>(prev_len: Length, updates: &U) -> Leng
     })
 }
 
+/// Check that `updates` is a valid bulk update for a list of length `len`.
+///
+/// Indices at or beyond `len` must form a contiguous run of appends starting at `len`, each
+/// passing `validate_append` (the same check as `push`). The appends are counted by scanning
+/// the map, and the count is checked against the `UpdateMap`'s `max_index`. If `max_index` is too
+/// small, `apply_updates` would silently drop the trailing entries.
+pub(crate) fn validate_bulk_update<T, U: UpdateMap<T>>(
+    len: usize,
+    updates: &U,
+    mut validate_append: impl FnMut(usize) -> Result<(), crate::Error>,
+) -> Result<(), crate::Error> {
+    // An entry at `usize::MAX` implies a length of `usize::MAX + 1`, which would overflow
+    // `updated_length`. The scan below is end-exclusive and can't reach it, so check it here.
+    if updates.get(usize::MAX).is_some() {
+        return Err(crate::Error::ListFull { len: usize::MAX });
+    }
+
+    let mut expected = len;
+    let mut error = None;
+    updates.for_each_range(len, usize::MAX, |index, _| {
+        if index != expected {
+            error = Some(crate::Error::BulkUpdateGap {
+                first_gap: expected,
+            });
+            return std::ops::ControlFlow::Break(());
+        }
+        if let Err(e) = validate_append(index) {
+            error = Some(e);
+            return std::ops::ControlFlow::Break(());
+        }
+        expected += 1;
+        std::ops::ControlFlow::Continue(Ok::<(), crate::Error>(()))
+    })?;
+    if let Some(e) = error {
+        return Err(e);
+    }
+
+    let reported_len = updated_length(Length(len), updates).as_usize();
+    if reported_len != expected {
+        return Err(crate::Error::BulkUpdateInconsistentMaxIndex {
+            reported_len,
+            actual_len: expected,
+        });
+    }
+    Ok(())
+}
+
 /// Get the hash of a node at `(depth, prefix)` from an optional HashMap.
 pub fn opt_hash(
     hashes: Option<&BTreeMap<(usize, usize), Hash256>>,

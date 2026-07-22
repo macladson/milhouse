@@ -282,8 +282,13 @@ where
                 list.apply_updates().unwrap();
                 list.tree_hash_root();
 
-                assert_eq!(new_list, *list);
-                *list = new_list;
+                // Intra-rebasing dedupes nodes by hash, so the result may not be structurally
+                // equal (`PartialEq`) to the original. Compare contents and hash instead, and
+                // discard the deduped list: later ops assert structural equality against
+                // freshly-built trees.
+                assert_eq!(new_list.len(), list.len());
+                assert_eq!(new_list.tree_hash_root(), list.tree_hash_root());
+                assert!(new_list.iter().eq(list.iter()));
             }
         }
     }
@@ -386,8 +391,9 @@ where
                 vect.apply_updates().unwrap();
                 vect.tree_hash_root();
 
-                assert_eq!(new_vect, *vect);
-                *vect = new_vect;
+                // Same as the `List` intra-rebase above.
+                assert_eq!(new_vect.tree_hash_root(), vect.tree_hash_root());
+                assert!(new_vect.iter().eq(vect.iter()));
             }
         }
     }

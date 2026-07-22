@@ -2,22 +2,44 @@ use std::fmt::{Display, Error as FmtError, Formatter};
 
 #[derive(Debug, PartialEq, Clone)]
 pub enum Error {
-    OutOfBoundsUpdate { index: usize, len: usize },
-    OutOfBoundsIterFrom { index: usize, len: usize },
-    ListFull { len: usize },
-    PackedLeafFull { len: usize },
-    LeafUpdateMissing { index: usize },
-    PackedLeafOutOfBounds { sub_index: usize, len: usize },
-    NodeUpdatesMissing { prefix: usize },
+    OutOfBoundsUpdate {
+        index: usize,
+        len: usize,
+    },
+    OutOfBoundsIterFrom {
+        index: usize,
+        len: usize,
+    },
+    ListFull {
+        len: usize,
+    },
+    PackedLeafFull {
+        len: usize,
+    },
+    LeafUpdateMissing {
+        index: usize,
+    },
+    PackedLeafOutOfBounds {
+        sub_index: usize,
+        len: usize,
+    },
+    NodeUpdatesMissing {
+        prefix: usize,
+    },
     InvalidListUpdate,
     InvalidVectorUpdate,
-    WrongVectorLength { len: usize, expected: usize },
+    WrongVectorLength {
+        len: usize,
+        expected: usize,
+    },
     PushNotSupported,
     UpdateLeafError,
     UpdateLeavesError,
     InvalidRebaseNode,
     InvalidRebaseLeaf,
-    BuilderInvalidDepth { depth: usize },
+    BuilderInvalidDepth {
+        depth: usize,
+    },
     BuilderExpectedLeaf,
     BuilderStackEmptyMerge,
     BuilderStackEmptyMergeLeft,
@@ -29,6 +51,13 @@ pub enum Error {
     BuilderStackLeftover,
     BuilderFull,
     BulkUpdateUnclean,
+    BulkUpdateGap {
+        first_gap: usize,
+    },
+    BulkUpdateInconsistentMaxIndex {
+        reported_len: usize,
+        actual_len: usize,
+    },
     CowMissingEntry,
     LevelIterPendingUpdates,
     IntraRebaseZeroHash,

@@ -309,7 +309,7 @@ where
 
     fn update<U: UpdateMap<T>>(
         &mut self,
-        updates: U,
+        updates: &U,
         hash_updates: Option<BTreeMap<(usize, usize), Hash256>>,
     ) -> Result<(), Error> {
         if let Some(max_index) = updates.max_index() {
@@ -320,10 +320,12 @@ where
             // Nothing to do.
             return Ok(());
         }
-        self.length = updated_length(self.length, &updates);
-        self.tree =
-            self.tree
-                .with_updated_leaves(&updates, 0, self.depth, hash_updates.as_ref())?;
+        // Update the tree before the length so that an error leaves `self` unchanged
+        // (`Interface::apply_updates` relies on this).
+        self.tree = self
+            .tree
+            .with_updated_leaves(updates, 0, self.depth, hash_updates.as_ref())?;
+        self.length = updated_length(self.length, updates);
         Ok(())
     }
 }
@@ -355,6 +357,10 @@ impl<T: Value, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
 }
 
 impl<T: Value + Send + Sync, N: Unsigned, U: UpdateMap<T>> List<T, N, U> {
+    /// Deduplicate equal subtrees within `self`, sharing memory between them.
+    ///
+    /// Deduplication is by hash, so the result may not be structurally equal (`PartialEq`) to
+    /// the original, although its contents and tree hash are unchanged.
     pub fn intra_rebase(&mut self) -> Result<(), Error> {
         // We need to be fully hashed in order to intra-rebase. To avoid putting this burden on the
         // caller, just do it here. If we're already fully-hashed this should be quick.

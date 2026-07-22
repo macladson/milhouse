@@ -29,7 +29,7 @@ pub trait MutList<T: Value>: ImmList<T> {
     fn replace(&mut self, index: usize, value: T) -> Result<(), Error>;
     fn update<U: UpdateMap<T>>(
         &mut self,
-        updates: U,
+        updates: &U,
         hash_updates: Option<BTreeMap<(usize, usize), Hash256>>,
     ) -> Result<(), Error>;
 }
@@ -86,7 +86,14 @@ where
     pub fn apply_updates(&mut self) -> Result<(), Error> {
         if !self.updates.is_empty() {
             let updates = std::mem::take(&mut self.updates);
-            self.backing.update(updates, None)
+            // On error, put the updates back so they aren't lost.
+            match self.backing.update(&updates, None) {
+                Ok(()) => Ok(()),
+                Err(e) => {
+                    self.updates = updates;
+                    Err(e)
+                }
+            }
         } else {
             Ok(())
         }
@@ -137,10 +144,18 @@ where
         self.len() == 0
     }
 
+    /// Set the pending updates to `updates`, to be applied on the next `apply_updates`.
+    ///
+    /// Errors if there are already pending updates, or if `updates` is invalid: indices beyond
+    /// the current length must form a contiguous run of valid pushes. A map with gaps would
+    /// otherwise create a list with missing elements and a wrong tree hash root.
     pub fn bulk_update(&mut self, updates: U) -> Result<(), Error> {
         if !self.updates.is_empty() {
             return Err(Error::BulkUpdateUnclean);
         }
+        crate::utils::validate_bulk_update(self.backing.len().as_usize(), &updates, |index| {
+            B::validate_push(index)
+        })?;
         self.updates = updates;
         Ok(())
     }

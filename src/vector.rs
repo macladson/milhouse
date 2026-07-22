@@ -262,7 +262,7 @@ where
 
     fn update<U: UpdateMap<T>>(
         &mut self,
-        updates: U,
+        updates: &U,
         hash_updates: Option<BTreeMap<(usize, usize), Hash256>>,
     ) -> Result<(), Error> {
         if let Some(max_index) = updates.max_index() {
@@ -273,9 +273,9 @@ where
             // Nothing to do.
             return Ok(());
         }
-        self.tree =
-            self.tree
-                .with_updated_leaves(&updates, 0, self.depth, hash_updates.as_ref())?;
+        self.tree = self
+            .tree
+            .with_updated_leaves(updates, 0, self.depth, hash_updates.as_ref())?;
         Ok(())
     }
 }
